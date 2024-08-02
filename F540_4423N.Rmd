@@ -1,0 +1,2732 @@
+---
+title: "F540 Project 4423N"
+output: bookdown::pdf_document2
+date: "2024-03-30"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message = FALSE, include = FALSE}
+packages <- c("tidyverse", "RSQLite", "dbplyr", "tibbletime", "xts", 
+              "timetk", "nlshrink", "PortfolioAnalytics", "PerformanceAnalytics", 
+              "doParallel", "foreach", "iterators", "GRS.test", "pracma", "bidask", 
+              "TTR", "zoo", "uncorbets", "fitdistrplus", "copula", "metRology", 
+              "corrplot", "ggcorrplot", "reshape2", "elasticnet", "ridge", "MASS", 
+              "glmnet", "pls", "xgboost", "keras", "forecast", "scales", "tidyquant", 
+              "kableExtra")
+
+load_results <- sapply(packages, require, character.only = TRUE)
+
+missing_packages <- packages[!load_results]
+
+for (pkg in missing_packages) {
+    message(paste("Installing package:", pkg))
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+}
+
+if (all(sapply(packages, require, character.only = TRUE))) {
+    print("All necessary packages installed and loaded.")
+    } else {
+    print("Some packages could not be loaded.")
+    }
+
+```
+
+```{r importing-dsiu-data, include = FALSE }
+F540_project_data <- dbConnect(
+    SQLite(),
+    'data/F540-project-data', 
+    extended_types = TRUE
+    )
+
+crsp_monthly <- tbl(F540_project_data, 'crsp_monthly') %>% collect() %>%
+    filter(date <= '2023-12-31')
+
+crsp_daily <- tbl(F540_project_data, 'crsp_daily') %>% collect() %>% 
+    filter(date <= '2023-12-31')
+
+macro_sentiment_monthly <- tbl(F540_project_data, 'macro_sentiment_monthly') %>% collect() %>%
+    filter(date <= '2023-12-31') %>% 
+    mutate_at(vars(-date), ~ (. - mean(.)) / sd(.)) %>% 
+    mutate(date = date %m+% months(1))
+
+dbDisconnect(F540_project_data)
+
+dsiu_data <- crsp_monthly %>% 
+    #remove assets with missing 2023 data
+    filter(!(permno %in% c('X10514', 'X10530', 'X26614'))) %>% # missing 2023 data
+    dplyr::select(date, permno, ret_excess)
+
+# create xts returns object 
+returns_xts <- crsp_monthly %>%
+    dplyr::select(permno, date, return) %>% 
+    filter(!(permno %in% c('X10514', 'X10530', 'X26614'))) %>% 
+    pivot_wider(names_from = permno, 
+                values_from = return) %>% 
+    tk_xts(select = -date, date_var = date)
+
+```
+# Diversification & Selecting Investible Universe
+## Cross-sectional Diversification
+```{r create-heatmaps, include = FALSE }
+# compute pearson, kendall and spearman correlation matrices 
+pearson_corr <- cor(returns_xts)
+kendall_corr <- cor(returns_xts, method = 'kendall')
+spearman_corr <- cor(returns_xts, method = 'spearman')
+
+# define Gerber correlation function
+gerbcorr <- function(R, th = 0.5){
+    n <- ncol(R)
+    nperiods <- nrow(R)
+    index <- 1:nperiods
+    
+    # finds sd of each series; set threshold in terms of the sd
+    std.dev <- apply(R, 2, sd, na.rm = TRUE)
+    th.sd <- th * std.dev
+    
+    correlation <- matrix(1, n , n)
+    for (i in 1:(n-1)){
+        for (j in 2:n){
+            pos <- sum(
+                (R[,i] >= th.sd[i] & R[,j] >= th.sd[j]) | (R[,i] <= -th.sd[i] & R[,j] <= -th.sd[j]),
+                na.rm = TRUE)
+            neg <- sum(
+                (R[,i] >= th.sd[i] & R[,j] <= -th.sd[j]) | (R[,i] <= -th.sd[i] & R[, j] >= th.sd[j]),
+                na.rm = TRUE)
+            correlation[i,j] <- 
+                correlation[j,i] <- (pos - neg) / (pos + neg)
+        }
+    }
+    row.names(correlation) <- colnames(R)
+    colnames(correlation) <- colnames(R)
+    return(correlation)
+}
+
+# define function to compute (mean) pairwise tail area dependence 
+pairwise_tail_area_dependence <- function(asset1, asset2, alpha = 0.95, method = "historical") {
+    # compute VaR at threshold alpha for each asset
+    var_asset1 <- VaR(asset1, p = alpha, method = method) %>% as.numeric()
+    var_asset2 <- VaR(asset2, p = alpha, method = method) %>% as.numeric()
+    
+    # T/F vector of tail events for each asset
+    tail_events_asset1 <- asset1 > var_asset1
+    tail_events_asset2 <- asset2 > var_asset2
+    
+    # find instances of joint tail events, calculate probabilities for each asset and average
+    joint_tail_events <- tail_events_asset1 & tail_events_asset2
+    prob_joint_tail_asset1 <- sum(joint_tail_events) / sum(tail_events_asset1)
+    prob_joint_tail_asset2 <- sum(joint_tail_events) / sum(tail_events_asset2)
+    lambda_u <- mean(prob_joint_tail_asset1, prob_joint_tail_asset2)
+    return(lambda_u)
+}
+
+# compute pairwise tail area dependence for all assets
+calculate_tail_area_dependence <- function(data, alpha = 0.95, method = "historical") {
+    asset_names <- colnames(data)
+    tad_matrix <- matrix(NA, nrow = length(asset_names), ncol = length(asset_names), dimnames = list(colnames(data), colnames(data)))
+    
+    for (i in 1:(length(asset_names) - 1)) {
+        for (j in (i + 1):length(asset_names)) {
+            tad_matrix[i, j] <- pairwise_tail_area_dependence(data[, i], data[, j], alpha, method)
+            tad_matrix[j, i] <- tad_matrix[i, j] 
+        }
+    }
+    # set diagonal to one as undefined
+    diag(tad_matrix) <- 1
+    return(tad_matrix)
+}
+
+# define function to compute (mean) pairwise quadrant dependence 
+pairwise_quadrant_dependence <- function(asset1, asset2) {
+    # Calculate individual probabilities of gains
+    prob_asset1_gains <- mean(asset1 > 0)
+    prob_asset2_gains <- mean(asset2 > 0)
+    
+    # Calculate joint probability of gains
+    joint_prob_gains <- mean((asset1 > 0) & (asset2 > 0))
+    
+    # Calculate the product of individual probabilities for comparison
+    expected_independent_prob <- prob_asset1_gains * prob_asset2_gains
+    
+    # Calculate quadrant dependence
+    quadrant_dependence <- joint_prob_gains - expected_independent_prob
+    
+    return(quadrant_dependence)
+}
+
+# compute pairwise quadrant dependence for all assets
+calculate_quadrant_dependence <- function(data) {
+    asset_names <- colnames(data)
+    quadrant_matrix <- matrix(NA, nrow = length(asset_names), ncol = length(asset_names), dimnames = list(colnames(data), colnames(data)))
+    
+    for (i in 1:(length(asset_names)-1)) {
+        for (j in (i + 1):length(asset_names)) {
+            quadrant_matrix[i, j] <- pairwise_quadrant_dependence(data[, i], data[, j])
+            quadrant_matrix[j, i] <- quadrant_matrix[i, j]
+        }
+    }
+    
+    diag(quadrant_matrix) <- 1  # Set diagonal to 1 since undefined
+    return(quadrant_matrix)
+}
+
+# calculate gerber, tad and qd correlation matrices
+gerber_corr <- gerbcorr(returns_xts)
+tad_corr <- calculate_tail_area_dependence(returns_xts)
+qd_corr <- calculate_quadrant_dependence(returns_xts)
+
+# define function to produce our heatmaps
+create_heatmap <- function(data, mean_diag = FALSE){
+    if (mean_diag) {
+        diag(data) <- mean(data)
+    }
+    data_melted <- melt(data)
+    data_melted %>% 
+        ggplot(aes(Var1, Var2, fill = value)) + 
+        geom_tile() + 
+        scale_fill_gradient2(low = 'cornflowerblue', high = 'red', mid = 'white', midpoint = mean(data)) +
+        theme_minimal() +
+        theme(
+            axis.text.x = element_blank(), 
+            axis.text.y = element_blank(), 
+            axis.ticks.x = element_line(color = 'black', linewidth = 0.5), 
+            axis.ticks.y = element_line(color = 'black', linewidth = 0.5), 
+            axis.title.x = element_blank(),  
+            axis.title.y = element_blank(), 
+            plot.title = element_text(hjust = 0.5)  
+        ) +
+        labs(fill = 'pairwise\ncorrelation')
+}
+
+# plot heatmaps - we set diagonal to mean to improve fidelity
+pearson_heatmap <- create_heatmap(pearson_corr, TRUE) + labs(title = 'Pearson Correlation')
+kendall_heatmap <- create_heatmap(kendall_corr, TRUE) + labs(title = 'Kendall Correlation')
+spearman_heatmap <- create_heatmap(spearman_corr, TRUE) + labs(title = 'Spearman Correlation')
+gerber_heatmap <- create_heatmap(gerber_corr, TRUE) + labs(title = 'Gerber Correlation')
+tad_heatmap <- create_heatmap(tad_corr, TRUE) + labs(title = 'Tail Area Dependence')
+qd_heatmap <- create_heatmap(qd_corr, TRUE) + labs(title = 'Quadrant Dependence')
+```
+
+We begin with an investigation into the correlation structure of our assets. There is no single unambiguous measure of risk to use for our analysis, so we employ a range of measures of dependence and compare the results. Specifically, we compute the Pearson, Kendall, Spearman, Gerber, Tail Area, and Quadrant dependence for our assets. This set allows us to see linear dependence, as in Pearson's correlation, as well as non-linear dependence captured by the copula-based measures of Kendall's Tau and Spearman's Rho. The Gerber statistic, for which we use a threshold $t_{i} = \frac{1}{2}\sigma_{i}$, is insensitive to outliers and thus gives a robust estimate of the dependence structure. 
+
+The tail area dependence, particularly that of the lower tail, is of great importance for portfolio construction. In practice, one wants to avoid large drawdowns at all costs, and if the portfolio constituents have significant lower-tail dependence this increases the probability of a catastrophic loss. For this reason we focus on the joint probabilities in the lower tail with a threshold of $\alpha = 0.95$. While it is not conventional, since the function of a heatmap is to analyse the dependence *between* assets we set the diagonal of each matrix to the mean of its elements - this markedly increases the fidelity of the plots, and the intra-asset correlations are of no importance (and trivially 1) in all of the above cases.
+
+&nbsp;
+
+```{r output-heatmaps, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '33.3%', fig.cap="\\label{fig:figs}Dependence heatmaps for allocated permnos"}
+par(mfrow = c(2,2))
+
+pearson_heatmap
+kendall_heatmap
+spearman_heatmap
+gerber_heatmap
+tad_heatmap
+qd_heatmap
+```
+
+&nbsp;
+
+As we can see from Figure \@ref(fig:output-heatmaps), all of our holistic measures are in general agreement on the dependence structure of the assets, with only tail area dependence differing significantly. This is not unexpected, since it is estimating 'asymptotic dependence' while the others are concerned with dependence across the entire distribution. The Gerber statistic, as a robust estimator, illustrates that a non-trivial portion of asset 'correlation' is simply down to noise; compared to the Pearson, Kendall and Spearman heatmaps there are significantly more assets found to have low dependence. This is driven by the significant estimation error associated with historical sample moments, and we see here the Gerber statistic can be one way to try and mitigate this. 
+
+Consistent across all of the general dependence measures is a cluster of three highly correlated assets in the lower left corner, with a Pearson correlation coefficient of $\rho\approx 0.8$. To get an idea of how co-dependent their returns are, we will select the two with the highest correlation, model their joint distribution, and simulate a large number of returns.
+
+```{r copula-modelling, include = FALSE}
+
+
+## modelling the joint distribution of the two most correlated assets ##
+
+# extract names of assets with highest correlation
+pearson_corr <- cor(returns_xts)
+
+diag(pearson_corr) <- 0
+copula_indices <- rownames(which(pearson_corr == max(pearson_corr), arr.ind = TRUE))
+
+copula_assets <- returns_xts[, colnames(returns_xts) %in% copula_indices]
+
+asset1 <- as.vector(copula_assets[, 1])
+asset2 <- as.vector(copula_assets[, 2])
+
+# select two assets randomly 
+set.seed(4423)
+comparison_indices <- sample(1:ncol(returns_xts), 2)
+
+asset3 <- as.vector(returns_xts[, comparison_indices[1]])
+asset4 <- as.vector(returns_xts[, comparison_indices[2]])
+
+# Fit t-distributions to the marginals
+
+# plots to illustrate how bad the standard R package t fit is
+fit1_bad <- fitdist(asset1,'t', start = list(df = 10))
+fit2_bad <- fitdist(asset1, 't', start = list(df = 10))
+
+fit1_bad_plot <- qqcomp(list(fit1_bad), plotstyle = "ggplot", legendtext = 'X15069', fitcol = 'cornflowerblue') + labs(title = 'Marginal distribution fit with default t-distribution')
+fit2_bad_plot <- qqcomp(list(fit2_bad), plotstyle = "ggplot", legendtext = 'X13928') + labs(title = '')
+
+# use metRology package t.scaled because it supports shifting and scaling
+fit1 <- fitdist(asset1, "t.scaled", start = list(df = 10, mean = mean(asset1), sd = sd(asset1)))
+fit2 <- fitdist(asset2, "t.scaled", start = list(df = 10, mean = mean(asset2), sd = sd(asset2)))
+
+fit3 <- fitdist(asset3, "t.scaled", start = list(df = 10, mean = mean(asset3), sd = sd(asset3)))
+
+fit4 <- fitdist(asset4, "t.scaled", start = list(df = 10, mean = mean(asset4), sd = sd(asset4)))
+
+params1 <- list(mean = fit1$estimate["mean"],
+                sd = fit1$estimate["sd"],
+                df = fit1$estimate["df"])
+
+params2 <- list(mean = fit2$estimate["mean"],
+                sd = fit2$estimate["sd"],
+                df = fit2$estimate["df"])
+
+params3 <- list(mean = fit3$estimate["mean"],
+                sd = fit3$estimate["sd"],
+                df = fit3$estimate["df"])
+
+params4 <- list(mean = fit4$estimate["mean"],
+                sd = fit4$estimate["sd"],
+                df = fit4$estimate["df"])
+
+fit1_plot <- qqcomp(list(fit1), plotstyle = "ggplot", legendtext = 'X15069', fitcol = 'cornflowerblue') + labs(title = 'Marginal distribution fit with t.scaled distribution')
+fit2_plot <- qqcomp(list(fit2), plotstyle = "ggplot", legendtext = 'X13928') + labs(title = '')
+
+# Transform the data to uniform marginals using the fitted t-distribution parameters
+u <- pt((asset1 - params1$mean) / params1$sd, df = params1$df)
+v <- pt((asset2 - params2$mean) / params2$sd, df = params2$df)
+
+ucomp <- pt((asset3 - params3$mean) / params3$sd, df = params3$df)
+vcomp <- pt((asset4 - params4$mean) / params4$sd, df = params4$df)
+
+# Fit t-copulas
+tcop <- tCopula(dim = 2, dispstr = "un")
+fit_tcop <- fitCopula(tcop, cbind(u, v), method = "ml")
+
+tcopcomp <- tCopula(dim = 2, dispstr = "un")
+fit_tcopcomp <- fitCopula(tcopcomp, cbind(ucomp, vcomp), method = "ml")
+
+
+# Simulate 1000 datapoints from the fitted copulas
+set.seed(4433)
+sim_data <- rCopula(1000, fit_tcop@copula)
+sim_data_comp <- rCopula(1000, fit_tcopcomp@copula)
+
+# Transform back to the original asset scale using the inverse t distribution function with the parameters used for the initial transformation
+asset1_sim <- params1$mean + qt(sim_data[,1], df = params1$df) * params1$sd
+asset2_sim <- params2$mean + qt(sim_data[,2], df = params2$df) * params2$sd
+
+asset3_sim <- params3$mean + qt(sim_data_comp[,1], df = params3$df) * params3$sd
+asset4_sim <- params4$mean + qt(sim_data_comp[,2], df = params4$df) * params4$sd
+
+# Create a data frame for plotting
+plot_data <- data.frame(asset1_sim, asset2_sim)
+plot_data_comp <- data.frame(asset3_sim, asset4_sim)
+
+# Plotting simulated joint distribution of asset returns
+copula_sim_plot <- ggplot(plot_data, aes(x = asset1_sim, y = asset2_sim)) +
+    geom_point(alpha = 0.5, color = "cornflowerblue") +
+    geom_abline(slope = 1, intercept = 0) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) + 
+    tune::coord_obs_pred() +
+    labs(title = "Simulated Joint Distribution of Most Correlated Assets", 
+         x = "Simulated Returns of X15069", 
+         y = "Simulated Returns of X13928"
+         )
+
+copula_sim_plot_comp <- ggplot(plot_data_comp, aes(x = asset3_sim, y = asset4_sim)) +
+    geom_point(alpha = 0.5, color = "cornflowerblue") +
+    geom_abline(slope = 1, intercept = 0) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) + 
+    tune::coord_obs_pred() +
+    labs(title = "Simulated Joint Distribution of Randomly Selected Assets", 
+         x = "Simulated Returns of Asset 1", 
+         y = "Simulated Returns of Asset 2"
+         )
+
+```
+
+To model the joint distribution we use a bivariate t-copula $C_{\nu, \rho}(u, v)$: 
+
+$$ C_{\nu, \rho}(u, v) = T_{\nu, \rho}\left(t_{\nu}^{-1}(u), t_{\nu}^{-1}(v)\right) $$
+
+* $\nu\colon$ degrees of freedom, $\rho\colon$ correlation coefficient , 
+* $x = t_{\nu}^{-1}(u)$ and $y = t_{\nu}^{-1}(v)$ where $t_{\nu}^{-1}(\cdot)$ is the inverse CDF of the t-distribution.
+* $T_{\nu, \rho}(x, y)$ is the CDF evaluated at $x = t_{\nu}^{-1}(u)$ and $y = t_{\nu}^{-1}(v)$ from the corresponding PDF of the bivariate t-distribution, $f(x, y; \nu, \rho)$, given by:
+$$
+f(x, y; \nu, \rho) = \frac{\Gamma\left(\frac{\nu + 2}{2}\right)}{\Gamma\left(\frac{\nu}{2}\right)\sqrt{\nu \pi (1-\rho^2)}}\left(1 + \frac{1}{\nu}\left(\frac{x^2 - 2\rho xy + y^2}{1-\rho^2}\right)\right)^{-\frac{\nu + 2}{2}}
+$$
+
+The reason we choose the t-copula is driven by the fact that there is leptokurticity in the return series; the t-distribution is able to accommodate this, and therefore produces a better fit than a Gaussian distribution. It is important to note that the standard t-distribution function in R does not support shifting or scaling, and this leads to a very poor fit of our return data. To overcome this we make use of the metRology package's *t.scaled* distribution which, as seen in Figure \@ref(fig:output-qqplots), gives a very good fit for our return series.
+
+```{r output-qqplots, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap="\\label{fig:figs}Q-Q plots for standard and scaled t-distributions"}
+par(mfrow = c(2,2))
+fit1_bad_plot
+fit1_plot
+fit2_bad_plot
+fit2_plot
+```
+
+Using the fitted t-distributions, we transform the returns to their uniform marginals and fit an unstructured t-copula by maximum likelihood. From this we simulate 1000 pairs of returns, and then transform the data back to the original asset scale using the inverse t-distribution function. For comparison, we include an equivalent simulation for two other assets selected randomly from our universe. The results are presented in Figure \@ref(fig:output-copula-sim), and we can see that the returns are indeed extremely highly correlated, and one should definitely consider whether they want to hold both of these assets. That said, the approach of asset selection by filtering on pairwise correlation is not very theoretically satisfying, since it overlooks both the returns and the interaction of the assets with all of the others, but it is one way in which we could consider refining our initial set.
+
+&nbsp;
+
+```{r output-copula-sim, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap="\\label{fig:figs}Simulated Joint Distribution of Asset Returns"}
+copula_sim_plot
+copula_sim_plot_comp
+```
+
+&nbsp;
+
+## Diversification over Time
+
+We next analyse how the correlation and diversification of our assets evolves over time and with market conditions, calculating our measures of dependence in the temporal dimensionp; of particular focus is the empirical regularity that asset correlations tend to increase during market downturns, reducing portfolio diversification when it is needed most. Additionally, we use two different measures of portfolio-level diversification:
+
+1. The inverse of the weight-based metric of Goetzmann, Li and Rouwenhorst, the ratio of the portfolio variance to the weighted average of the constituent assets variances: $$GLR(w)^{*} = GLR(w)^{-1} = \left(\frac{w'\Sigma w}{\sum_{k = 1}^{N}w_{k}\sigma_{k}^{2}}\right)^{-1}$$
+We invert the standard GLR statistic to make it consistent with other measures of diversification, for which a higher value corresponds to greater diversification, for more intuitive comparison.
+
+2. The effective number of minimum torsion bets, MTB, defined as in Meucci (2015) by the entropy of the portfolio variance factors after PCA: 
+$$MTB(w) = exp\left(-\sum_{k = 1}^{N}p_{k}^{*}~ln(p_{k}^{*})\right) $$
+where the rotation of the principal axes is chosen such that it minimises the sum of squared errors between the factor returns and those of the original assets. 
+
+Using a 12-month rolling window, we plot the average Pearson, Kendall, Spearman and Gerber correlations alongside the GLR* and MTB values that are achieved by an equal-weighted portfolio of our assets, as a proxy for 'aggregate market diversification'. The results, which can be found in Figure \@ref(fig:output-rolling-corr), emphasise that the asset dependencies and portfolio diversification do indeed vary significantly over time and with market conditions. 
+
+&nbsp;
+
+```{r rolling-correlation, include = FALSE}
+# plotting rolling average correlation for our correlation metrics #
+
+# create rolling correlation function
+rolling_correlation <- function(data, cor_func, window_size = 12) {
+    rollapply(data, width = window_size, FUN = function(x) {
+        cor_matrix <- cor_func(x)
+        avg_cor <- mean(cor_matrix[lower.tri(cor_matrix)], na.rm = TRUE)
+        return(avg_cor)
+    }, by.column = FALSE, align = 'right')
+}
+
+# ENB/MTB functions
+ENB_matrix <- function(R) {
+    ENB_matrix <- torsion(sigma = cov(R), 
+                   model = 'pca'
+                   )
+    return(ENB_matrix)
+}
+
+MTB_matrix <- function(R) {
+    MTB_matrix <- torsion(sigma = cov(R), 
+                   model = 'minimum-torsion'
+                   )
+    return(MTB_matrix)
+}
+
+max_ENB <- function(R) {
+    torsion_matrix <- ENB_matrix(R)
+    EW <- rep(1 / ncol(R), ncol(R))
+    max_ENB <- max_effective_bets(
+        x0 = EW,
+        sigma = cov(R),
+        t = torsion_matrix,
+        maxeval = 5000L,
+        maxiter = 5000L
+        )
+    return(max_ENB$enb)
+}
+
+max_MTB <- function(R) {
+    torsion_matrix <- MTB_matrix(R)
+    EW <- rep(1 / ncol(R), ncol(R))
+    max_MTB <- max_effective_bets(
+        x0 = EW,
+        sigma = cov(R),
+        t = torsion_matrix,
+        maxeval = 5000L,
+        maxiter = 5000L
+        )
+    return(max_MTB$enb)
+}
+
+calculate_ENB <- function(R, weights = rep(1 / ncol(R), ncol(R))) {
+    torsion_matrix <- ENB_matrix(R)
+    ENB <- effective_bets(
+        b = weights, 
+        sigma = cov(R), 
+        t = torsion_matrix
+    )
+}
+
+calculate_MTB <- function(R, weights = rep(1 / ncol(R), ncol(R))) {
+    torsion_matrix <- MTB_matrix(R)
+    ENB <- effective_bets(
+        b = weights, 
+        sigma = cov(R), 
+        t = torsion_matrix
+    )
+}
+
+rolling_bets <- function(data, window_size = 36) {
+    rollapply(data, width = window_size, FUN = function(x) {
+        MTB <- calculate_MTB(x)
+        return(MTB$enb)
+    }, by.column = FALSE, align = 'right')
+}
+
+# GLR functions
+calculate_GLR <- function(R, weights = rep(1 / ncol(R), ncol(R))){
+    cov_matrix = cov(R)
+    GLR <- ((t(weights) %*% cov_matrix %*% weights) / sum(weights * diag(cov_matrix)))
+    return(as.numeric(GLR)^-1) # invert our GLR to match ENB
+}
+
+
+
+rolling_GLR <- function(data, weights = rep(1 / ncol(R), ncol(R)), window_size = 12){
+    rollapply(data, width = window_size, FUN = function(x) {
+        GLR <- calculate_GLR(x)
+        return(GLR)
+    }, by.column = FALSE, align = 'right')
+}
+
+# Parallelisation of Gerber correlation - takes too long to run otherwise
+gerbcorr_parallel <- function(R, th = 0.5) {
+  n <- ncol(R)
+ 
+  # finds sd of each series; set threshold in terms of the sd
+  std.dev <- apply(R, 2, sd, na.rm = TRUE)
+  th.sd <- th * std.dev
+  
+  # Prepare to collect results
+  correlations <- foreach(i = 1:(n-1), .combine = 'c', .packages = 'foreach') %:% 
+    foreach(j = (i+1):n, .combine ='c') %dopar% {
+      pos <- sum((R[,i] >= th.sd[i] & R[,j] >= th.sd[j]) | (R[,i] <= -th.sd[i] & R[,j] <= -th.sd[j]), na.rm = TRUE)
+      neg <- sum((R[,i] >= th.sd[i] & R[,j] <= -th.sd[j]) | (R[,i] <= -th.sd[i] & R[,j] >= th.sd[j]), na.rm = TRUE)
+      correlation <- (pos - neg) / (pos + neg)
+      return(correlation)
+    }
+  # Convert the linear correlations vector into a symmetric matrix
+  correlation_matrix <- matrix(1, nrow = n, ncol = n, dimnames = list(colnames(R), colnames(R)))
+  k <- 1
+  for (i in 1:(n-1)) {
+    for (j in (i+1):n) {
+      correlation_matrix[i, j] <- correlations[k]
+      correlation_matrix[j, i] <- correlations[k]
+      k <- k + 1
+    }
+  }
+  return(correlation_matrix)
+}
+
+plot_rolling_correlation <- function(data, cor_func, window_size = 12, type = NULL, GLR = FALSE, MTB = FALSE){
+    if (GLR) {
+        rolling_corr <- rolling_GLR(data)
+    }
+    if (MTB) {
+        rolling_corr <- rolling_bets(data, window_size = 36) 
+    } else {
+        rolling_corr <- rolling_correlation(data, cor_func, window_size)
+    }
+    
+    df <- data.frame(date = index(rolling_corr), correlation = coredata(rolling_corr))
+    ggplot(df, aes(x = date, y = correlation)) + 
+        geom_line() + 
+        theme_minimal() + 
+        labs(
+            x = 'Date',
+            y = 'Average Pairwise Correlation'
+        ) +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        scale_x_date(date_breaks = '4 years', date_labels = '%Y') +
+    # Adding recession periods as shaded areas
+        geom_rect(data = data.frame(
+            start = as.Date(c('2001-03-01', '2007-12-01', '2020-02-01')),
+            end = as.Date(c('2001-11-30', '2009-06-30', '2020-04-30'))),
+            inherit.aes = FALSE,
+            aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+            fill = "cornflowerblue", alpha = 0.25)
+}
+
+
+# create wrapper functions for our correlation measures 
+kendall_correlation <- function(x) {cor(x, method = 'kendall')}
+spearman_correlation <- function(x) {cor(x, method = 'spearman')}
+gerber_correlation <- function(x) {gerbcorr_parallel(x)}
+MTB_correlation <- function(x) {calculate_MTB(x)}
+
+pearson_rc_plot <- plot_rolling_correlation(returns_xts, cor, type = 'Pearson') + 
+    labs(title = 'Pearson Correlation')
+kendall_rc_plot <- plot_rolling_correlation(returns_xts, kendall_correlation, type = 'Kendall') + 
+    labs(title = "Kendall's Tau")
+spearman_rc_plot <- plot_rolling_correlation(returns_xts, spearman_correlation, type = 'Spearman') + 
+    labs(title = "Spearman's Rank")
+
+gerber_rc_plot <- plot_rolling_correlation(returns_xts, gerber_correlation, type = 'Gerber')
+
+
+GLR_rc_plot <- plot_rolling_correlation(returns_xts,
+                                        cor_func = rolling_GLR,
+                                        GLR = TRUE
+                                        ) + 
+    labs(
+        title = 'GLR* of 1/N portfolio',
+        y = 'GLR*'
+    )
+
+MTB_rc_plot <- plot_rolling_correlation(returns_xts[, 1:25],
+                                        cor_func = MTB_correlation,
+                                        window_size = 36, 
+                                        MTB = TRUE
+                                        ) +
+    labs(
+        title = 'MTB of 1/N portfolio',
+        y = 'Minimum Torision Bets'
+    )
+
+```  
+
+```{r output-rolling-corr, warning = FALSE, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '33.3%', fig.cap="\\label{fig:figs}Correlation and Diversification measures over time"}
+par(mfrow = c(2,2))
+
+pearson_rc_plot
+kendall_rc_plot
+GLR_rc_plot
+spearman_rc_plot
+gerber_rc_plot
+MTB_rc_plot
+```
+
+&nbsp;
+
+Highlighted in blue are the periods corresponding to NBER recessions, and we can see that aggregate inter-asset correlation tends to drastically increase in these periods. The diversification measures are strongly affected by market conditions, markedly decreasing in the shaded periods, particularly the 2007Q4 - 2009Q2 recession. Specifically, during poor market conditions correlation-adjusted concentration increases and the effective number of minimum torsion bets decreases, reducing portfolio diversification and increasing correlation risk exposure just when negative movements are most likely.
+
+&nbsp;
+
+## Transaction Costs 
+The inclusion of transaction costs has historically been overlooked in the literature, despite being critical to whether a potential strategy is actually *implementable*. Despite the great decrease in transaction costs for smaller capitalisation stocks over the last two decades, a significant difference remains between trading the largest and smallest stocks on the market. The cost of trading also varies across factors, and is why many strategies incorporating short-term reversal and momentum, which inherently include significant turnover, find their gross alpha entirely eroded by the cost of implementing them. In this paper we endeavor wherever possible to incorporate transaction costs directly into our portfolio weight selection, as well as correcting our results *ex-post* for their impact.
+
+It is here that we begin refining our selection of assets. Three of the assets are no longer traded, two having undergone mergers and one a voluntary delisting in 2023. We use daily OHLC data taken from CRSP to calculate our transaction costs, and some of our assets have significant missing data. Due to the sensitivity of the OHLC volatility estimation, we remove assets with more than 1% missing observations and impute using cubic spline interpolation within each asset for any missing values. This is an attempt to strike a balance between having accurate, reliable data without dropping too many assets, and reduces the set of assets considered to 88.
+
+We compute our OHLC volatilities with the Yang-Zhang estimator, and use this to calculate the bid-ask spread using the estimator of Ardia, Guidotti & Kroencke (2021), which is halved to give an estimate for the transaction cost. We analyse the cost of trading in both dimensions, taking the mean across assets and plotting it against time, as well as calculating the mean for each asset and plotting it against market capitalisation. The results, seen in Figure \@ref(fig:output-tc-plots), show that average volatility and transaction costs vary significantly both cross-sectionally and with market conditions, again notably rising in the periods corresponding to NBER recessions. Only one microcap stock has made it this far into the analysis, effectively answering the question of whether to drop them for us. Given our results, *if* machine learning strategies can learn to divest leading up to recessions, they will not only be side-stepping downwards market movements but also avoiding the increased transaction costs associated with them.
+
+```{r modelling-transaction-costs, include = FALSE}
+# creating dataframe for OHLC calculations # 
+
+# removing assets with many NAs
+ohlc_data <- crsp_daily %>% 
+    filter(!(permno %in% c('X10514', 'X10530', 'X26614'))) %>% 
+    dplyr::select(permno, date, return, open, high, low, close) %>% 
+    group_by(permno) %>% 
+    mutate(nacount = sum(is.na(open) | is.na(high) | is.na(low) | is.na(close))) %>% 
+    dplyr::filter(nacount < 61) %>% # remove observations with more than 1% missing values
+    dplyr::select(-nacount) %>% 
+    ungroup()
+
+# cubic spline interpolation and LOCF
+ohlc_data <- ohlc_data %>% mutate(across(.cols = where(is.numeric),
+                  .fns = ~ na.spline(.x, na.rm = FALSE))
+           ) %>% 
+    mutate(across(.cols = where(is.numeric),
+                  .fns = ~ na.locf(.x, na.rm = FALSE))
+           ) %>%
+    mutate(across(.cols = where(is.numeric),
+                  .fns = ~ na.locf(.x, fromLast = TRUE, na.rm = FALSE))
+           ) %>%
+    ungroup() 
+
+# use Yang-Zhang estimator for calculation as minimum estimation error - see TTR for details
+
+# function to calculate volatility which we map over groups
+calculate_volatility <- function(data) {
+  volatility_values <- TTR::volatility(OHLC = data %>% dplyr::select(open, high, low, close), 
+                                       n = 20, 
+                                       calc = "yang.zhang",
+                                       N = 252,
+                                       aligned = TRUE)
+  return(tibble(date = data$date, volatility = volatility_values))
+}
+
+volatility_data <- ohlc_data %>%
+    group_by(permno) %>%
+    nest() %>%
+    mutate(volatility_data = map(data, calculate_volatility)) %>%
+    dplyr::select(-data) %>%
+    unnest(volatility_data) %>% 
+    na.omit() # removes the leading NAs
+
+
+# calculate monthly average volatility for plotting
+volatility_data_monthly <- volatility_data %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(permno, month) %>%
+  summarise(volatility = mean(volatility, na.rm = TRUE), .groups = 'drop') %>%
+  ungroup() %>%
+  rename(date = month)
+
+
+# Merge volatility data with market capitalization data
+vol_mktcap <- inner_join(volatility_data_monthly,
+                         crsp_monthly %>% dplyr::select(permno, date, mktcap),
+                         by = c("permno", "date")
+                         ) %>% group_by(permno) %>%
+    summarise(volatility = mean(volatility), 
+              mktcap = mean(mktcap))
+
+# plotting average volatility over time
+avg_volatility_over_time <- volatility_data_monthly %>%
+    group_by(date) %>%
+    summarise(avg_volatility = mean(volatility, na.rm = TRUE), .groups = 'drop')
+
+avg_vol_plot <- ggplot(avg_volatility_over_time, aes(x = date, y = avg_volatility)) +
+    geom_line() +
+    expand_limits(y = 0) + 
+    theme_minimal() +
+    labs(
+        x = "Date",
+        y = "Average Volatility",
+        title = "Average Volatility Over Time"
+        ) + 
+    geom_hline(
+        yintercept = mean(avg_volatility_over_time$avg_volatility),
+        linetype = "dashed",
+        color = "cornflowerblue") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_x_date(date_breaks = '4 years', date_labels = '%Y') +
+    # Adding recession periods as shaded areas
+        geom_rect(data = data.frame(
+            start = as.Date(c('2001-03-01', '2007-12-01', '2020-02-01')),
+            end = as.Date(c('2001-11-30', '2009-06-30', '2020-04-30'))),
+            inherit.aes = FALSE,
+            aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+            fill = "cornflowerblue", alpha = 0.25)
+
+vol_mktcap_plot <- vol_mktcap %>%
+    ggplot(aes(x = mktcap, y = volatility)) +
+    geom_point() +
+    expand_limits(y = 0) + 
+    geom_hline(
+        yintercept = mean(vol_mktcap$volatility),
+        linetype = "dashed",
+        color = "cornflowerblue") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_x_log10(labels = scales::dollar_format(
+        suffix = "M", prefix = "$"), 
+        name = "Market Capitalisation (log scale)"
+        ) +  
+    labs(
+        x = "Market Capitalisation (log scale)",
+        y = "Volatility", title = "Asset Volatility vs. Market Capitalisation")
+
+
+
+# calculating Bid-Ask spread from OHLC data using bidask package
+# the function edge() implements the efficient estimator described in Ardia, Guidotti & Kroencke (2021)
+# output value of 0.01 corresponds to a spread estimate of 1%
+
+# estimating the bid-ask spread for each asset in each month #
+bidask_monthly <- ohlc_data %>% 
+    mutate(yyyymm = format(date, '%Y-%m')) %>% 
+    group_by(permno, yyyymm) %>% 
+    summarise(
+        bidask = edge(open, high, low, close),
+        .groups = 'drop'
+        ) %>% 
+    mutate(
+        date = ym(yyyymm) %m+% months(1), # aligns dates correctly - bid-ask spread calculated from previous months data
+        .after = permno
+        ) %>% 
+    dplyr::select(-yyyymm)
+
+transcost_monthly <- bidask_monthly %>%
+  mutate(transcost = bidask / 2)
+
+
+transcost_mktcap <- inner_join(transcost_monthly,
+                               crsp_monthly %>% dplyr::select(permno, date, mktcap),
+                               by = c("permno", "date")) %>%
+  group_by(permno) %>%
+  summarise(transcost = mean(transcost, na.rm = TRUE),
+            mktcap = mean(mktcap, na.rm = TRUE)) %>%
+  ungroup()
+
+avg_transcost_over_time <- transcost_monthly %>%
+  group_by(date) %>%
+  summarise(transcost = mean(transcost, na.rm = TRUE), .groups = 'drop')
+
+# plotting average transaction cost over time
+avg_transcost_plot <- avg_transcost_over_time %>% 
+    ggplot(aes(x = date, y = transcost)) +
+    geom_line() +
+    expand_limits(y = 0) + 
+    geom_hline(
+        yintercept = mean(avg_transcost_over_time$transcost),
+        linetype = "dashed",
+        color = "cornflowerblue") +
+    theme_minimal() +
+    labs(
+        x = "Date",
+        y = "Average Transaction Cost",
+        title = "Average Transaction Cost Over Time"
+    ) + 
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_x_date(date_breaks = '4 years', date_labels = '%Y') + 
+    scale_y_continuous(labels = percent, name = "Transaction Cost") +
+    # Adding recession periods as shaded areas
+    geom_rect(data = data.frame(
+        start = as.Date(c('2001-03-01', '2007-12-01', '2020-02-01')),
+        end = as.Date(c('2001-11-30', '2009-06-30', '2020-04-30'))),
+        inherit.aes = FALSE,
+        aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+        fill = "cornflowerblue", alpha = 0.25)
+
+
+# plotting transaction cost against market cap 
+transcost_mktcap_plot <- ggplot(transcost_mktcap, aes(x = mktcap, y = transcost)) +
+    geom_point() + 
+    expand_limits(y = 0) + 
+            geom_point(
+            data = transcost_mktcap %>% filter(transcost > 0.006),
+            colour = 'red',
+            shape = 21,
+            size = 3,
+            stroke = 0.55
+            ) +
+    geom_hline(
+        yintercept = mean(avg_transcost_over_time$transcost),
+        linetype = "dashed",
+        color = "cornflowerblue") +
+    geom_hline(
+        yintercept = 0.006,
+        linetype = "dotted",
+        color = "red", 
+        linewidth = 0.6) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_x_log10(
+        labels = dollar_format(suffix = "M", prefix = "$"),
+        name = "Market Capitalisation (log scale)"
+        ) +
+    scale_y_continuous(labels = percent, name = "Transaction Cost") +
+    labs(
+        x = "Market Capitalisation (log scale)",
+        y = "Transaction Cost",
+        title = "Transaction Cost vs. Market Capitalisation"
+        )
+
+# locating assets with TCs above 60bps
+above60bps <- transcost_mktcap %>% 
+    filter(transcost > 0.006) %>% 
+    pull(permno)
+
+# mean TC of 37bps
+mean_tc <- transcost_mktcap %>% 
+    filter(!(permno %in% above60bps)) %>% 
+    pull(transcost) %>% mean() * 100
+
+# permno indices for assets in investible subset
+selected_permnos <- transcost_mktcap %>% 
+    filter(!(permno %in% above60bps)) %>% 
+    pull(permno)
+
+# spanning test #  
+hktest <- function(rt,rb){
+    K = ncol(as.matrix(rb))
+    N = ncol(as.matrix(rt))
+    Tn = nrow(as.matrix(rt))
+    A <- rbind(cbind(1, matrix(0, 1, K)),
+    cbind(0, -matrix(1, 1, K)))
+    C <- rbind(matrix(0, 1, N), -matrix(1, 1, N))
+    X <- cbind(matrix(1, Tn, 1), rb)
+    B <- mldivide(X,rt)
+    Theta <- A %*% B - C
+    e <- as.matrix(rt)-X%*%B
+    Sigma <- cov(e)
+    H <- Theta%*%inv(Sigma)%*%t(Theta)
+    mu1 <- t(colMeans(rb))
+    V11i <- inv(cov(rb))
+    a1 <- mu1%*%V11i%*%t(mu1)
+    b1 <- colSums(V11i%*%t(mu1))
+    c1 <- sum(V11i)
+    d1 <- a1*c1-b1^2
+    G <- rbind(cbind(1+a1, b1), cbind(b1, c1))
+    lam <- eig(H %*% inv(G))
+    Ui <- prod(1+lam)
+    if (N ==1) {
+        Ftest <- (Tn-K-1)*(Ui-1)/2
+    } else {
+            Ftest <- (Tn-K-N)*(sqrt(Ui)-1)/N
+    }
+    p = ifelse(N>1,
+    pf(Ftest,df1=2*N,
+       df2 = 2*(Tn-N-K),
+       lower.tail=FALSE),
+    pf(Ftest,df1 = 2, df2 = (Tn - K - 1),
+       lower.tail = FALSE))
+    HK = rbind(Ui,p)
+    rownames(HK) = c('F-stat', 'p-value')
+return(HK)
+}
+
+test_assets <- crsp_monthly %>% 
+    dplyr::select(permno, date, return) %>% 
+    filter(!(permno %in% c('X10514', 'X10530', 'X26614'))) %>% # missing 2023 data
+    filter(!(permno %in% selected_permnos)) %>% 
+    pivot_wider(names_from = permno, 
+                values_from = return) %>% 
+    tk_xts(date_var = date, select = -date)
+
+benchmark_assets <- crsp_monthly %>% 
+    dplyr::select(permno, date, return) %>% 
+    filter(permno %in% selected_permnos) %>% 
+    pivot_wider(names_from = permno, 
+                values_from = return) %>% 
+    tk_xts(date_var = date, select = -date)
+
+# outputs the F-stat and p-value for the spanning test and efficiency tests
+effiency_test <- GRS.test(test_assets,benchmark_assets)
+efficiency_results <- data.frame('F-stat' = as.numeric(effiency_test$GRS.stat[[1]]),
+                           'p-value' = as.numeric(effiency_test$GRS.pval[[1]]))
+
+spanning_results <- hktest(test_assets, benchmark_assets)
+
+###
+efficiency_results
+spanning_results
+###
+```
+
+```{r output-tc-plots, warning = FALSE, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap = "\\label{fig:figs}Volatility and Transaction Costs"}
+par(mfrow = c(2,2))
+
+avg_vol_plot 
+avg_transcost_plot
+vol_mktcap_plot
+transcost_mktcap_plot 
+```
+
+To conclude this section and our asset selection, we filter out those that have historical mean transaction costs of greater than 60bps, shown by the red dotted line in Figure \@ref(fig:output-tc-plots). This leaves us with our investible set of 83 assets, with mean transaction costs of 37bps. Furthermore, a Gibbons-Ross-Shanken test against the complete set of assets does not reject the null of mean-variance efficiency at the 5% level ($(F = 1.51,~p = 0.11)$). That our subset of assets is mean-variance efficient with respect to the original set is encouraging, and we have significantly reduced our exposure to systematic/macro risk and cost of trading with our selection.
+
+# Traditional Approaches
+## Unconditional Mean-Variance
+
+In this section we undertake a review of strategies derived from mean-variance analysis, with focus on their performance across different points in the market cycle. Due to word-count constraints this section is forced to brief, but we endeavour to summarise the main approaches. There are simply too many strategies to present clearly at once, so we attempt to chunk them into intuitive groups with comparison to a consistent benchmark.
+
+For each strategy we conduct rolling analysis at a monthly frequency with a 60 month window, incorporating within the optimisation proportional transaction costs of 37bps, and using asset-specific transaction costs when calculating net returns.^[A flexible way to do this is to take the absolute value of the difference of the $T \times N$ portfolio weights matrix, and multiply it by the $N\times 1$ vector of the asset transaction costs. This gives a $T\times 1$ vector corresponding to the transaction costs in each period, which can then simply be subtracted from the gross return. As with everything else I cover briefly, full details/implementation can be found in the RMarkdown document.] 
+
+We begin by considering, in part to illustrate the shortcomings of unconstrained mean-variance optimisation, the following portfolio specifications: 
+
+1. Unconstrained Mean-Variance (MV-U)
+2. Constrained Mean-Variance (long only) (MV-C)
+3. Minimum Variance (MinVar)
+4. 1/N
+
+As can be seen from Figure \@ref(fig:mvu-plot), the 1/N portfolio comprehensively outperforms the unconditional mean-variance portfolios both un-adjusted for and net of transaction costs. In keeping with previous research, and relating to Question 1, the minimum variance portfolio performs the best of the unconditional strategies. The inclusion of transaction costs *ex-ante* into our optimisation tempers the worst eccentricities of true unconstrained mean-variance optimisation, but the MV-U portfolio consistently performs least well.
+```{r unconditional-mean-variance, include = FALSE}
+returns_xts <- crsp_monthly %>% 
+    dplyr::select(permno, date, return) %>% 
+    filter(permno %in% selected_permnos) %>% 
+    pivot_wider(names_from = permno, 
+                values_from = return
+                ) %>% 
+    tk_xts(date_var = date, select = -date)
+
+R <- returns_xts
+assets <- colnames(R)
+
+# creating base portfolio object 
+init.portf <- portfolio.spec(assets)
+init.portf <- add.objective(init.portf, type = 'risk', name = 'StdDev')
+init.portf <- add.constraint(portfolio = init.portf, type = 'full_investment')
+init.portf <- add.constraint(portfolio = init.portf, type = 'long_only')
+init.portf <- add.constraint(init.portf, type = 'transaction_cost', ptc = 0.0037)
+
+# unconstrained mean-variance 
+mvu_portf <- init.portf 
+mvu_portf <- add.objective(mvu_portf, type = 'return', name = 'mean')
+
+
+# constrained mean-variance 
+mvc_portf <- init.portf
+mvc_portf <- add.objective(mvc_portf, type = 'return', name = 'mean')
+mvc_portf <- add.constraint(mvc_portf, type = 'long_only')
+
+# minimum variance  
+minvar_portf <- init.portf
+
+optimise_portf_rebal <- function(portf) {
+    optimize.portfolio.rebalancing(
+    R, portfolio = portf,
+    optimize_method = 'DEoptim',
+    DEoptim.control = list(parallel = TRUE,
+                           parallelType = 1,
+                           packages = "iterators"),
+    trace = TRUE,
+    rebalance_on = 'months',
+    training_period = 60
+    )
+}
+
+# portfolio optimisation
+
+cl <- makeCluster(detectCores() - 2)
+registerDoParallel(cl)
+
+mvu_opt <- optimise_portf_rebal(mvu_portf)
+
+
+mvc_opt <- optimise_portf_rebal(mvc_portf)
+
+minvar_opt <- optimise_portf_rebal(minvar_portf)
+
+one_n_ret <- Return.portfolio(R,
+                              weights = rep(1/ncol(R), ncol(R)),
+                              rebalance_on = "months")
+
+mvu_ret <- Return.portfolio(
+    R, 
+    weights = mvu_weights,
+    rebalance_on = 'months'
+    )
+
+mvc_ret <- Return.portfolio(
+    R, 
+    weights = mvc_weights,
+    rebalance_on = 'months'
+    )
+
+minvar_ret <- Return.portfolio(
+    R, 
+    weights = minvar_weights,
+    rebalance_on = 'months'
+    )
+
+# adjusting for transaction costs
+transaction_costs <- transcost_mktcap %>% 
+    filter(permno %in% selected_permnos) %>% 
+    pull(transcost)
+
+transcost_vector <- matrix(transaction_costs, nrow = 1)
+
+one_n_turnover <- 0.05 # estimated monthly turnover to rebalance EW portfolio (DGU 2009)
+
+calculate_net_returns <- function(portf_weights, portf_ret,
+                                  transcosts = transcost_vector) {
+    weight_diffs <- abs(diff(portf_weights))
+    period_costs <- weight_diffs %*% t(transcosts)
+    
+    period_costs_xts <- xts(period_costs[-1], order.by = index(portf_ret))
+    
+    return(portf_ret - period_costs_xts)
+    
+}
+
+one_n_ret_net <- one_n_ret - (one_n_turnover * 0.0037)
+mvu_ret_net <- calculate_net_returns(mvu_weights, mvu_ret)
+mvc_ret_net <- calculate_net_returns(mvc_weights, mvc_ret)
+minvar_ret_net <- calculate_net_returns(minvar_weights, minvar_ret)
+
+portf_ret_mvu <- merge(mvu_ret, mvc_ret, minvar_ret, one_n_ret)
+
+portf_ret_mvu_net <- merge(mvu_ret_net, mvc_ret_net, minvar_ret_net, one_n_ret_net)
+
+colnames(portf_ret_mvu) <- c('MV-U', 'MV-C', 'Min-Var', '1/N')
+colnames(portf_ret_mvu_net) <- c('MV-U', 'MV-C', 'Min-Var', '1/N')
+
+# table of results
+apply(portf_ret_mvu[complete.cases(portf_ret_mvu)], 2, function(x) tail(cumsum(x), 1))
+apply(portf_ret_mvu[complete.cases(portf_ret_mvu)], 2, function(x) (nrow(portf_ret_mvu[complete.cases(portf_ret_mvu)]) / 12) * sqrt(12) * sqrt(var(x)))
+
+```
+
+```{r mvu-plot, warning = FALSE, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap = "\\label{fig:figs}Unconditional Mean-Variance Performance"}
+charts.PerformanceSummary(
+    portf_ret_mvu,
+    lwd = 2,
+    main = 'Performance Comparision'
+    )
+
+charts.PerformanceSummary(
+    portf_ret_mvu_net,
+    lwd = 2,
+    main = 'Performance Comparision - Net of Transaction Costs'
+    )
+```
+
+## Conditional Mean-Variance
+
+We next consider conditional mean-variance strategies, including for comparison the MV-U and 1/N portfolios, conducting the same analysis for each of the following specifications: 
+
+1. Linear Shrinkage (MVC-LS)
+2. Non-linear Shrinkage (MVC-NLS)
+3. Gerber Correlation (MVC-Gerber)
+4. Volatility Timing (MVC-VT)
+
+As can be seen from Figure \@ref(fig:mv-plot-2), the conditional mean-variance strategies perform significantly better than their unconditional counterparts. In particular, the linear shrinkage approach is able to match the 1/N portfolio before transaction costs, but its higher turnover means that it falls short in a net sense. We should note that each of the portfolios experience huge drawdowns of up to 50% and 20% in the two recession periods respectively; unsurprisingly the mean-variance strategies have not learned to divest leading up to recessions!
+```{r conditional-mean-variance, include = FALSE}
+# change to full data later
+R <- returns_xts[, 1:10]
+
+shrinkage.portf <- init.portf
+shrinkage.portf <- add.objective(shrinkage.portf, type = 'return', name = 'mean')
+
+mom <- function(R, f_mu, f_sigma){
+    out <- list()
+    out$mu <- f_mu(R) 
+    out$sigma <- f_sigma(R)
+    return(out)
+}
+
+# linear shrinkage
+mom_linshrink <- function(R){
+    out <- mom(R, colMeans, function(x) linshrink_cov(x))
+    return(out)
+}
+
+# non-linear shrinkage
+mom_nlshrink <- function(R){
+    out <- mom(R, colMeans, function(x) nlshrink_cov(x))
+    return(out)
+}
+
+# Volatility timing
+mom_vt <- function(R){
+    out <- mom(R, colMeans, function(x) diag(diag(cov(x))))
+    return(out)
+}
+
+# Gerber covariance 
+gerber_cov = function(R, th = 0.5){
+    n <- ncol(R)
+    nperiods <- nrow(R)
+    index <- 1 : nperiods
+    
+    # finds sd of each series; set threshold in terms of the sd
+    std.dev <- apply(R[index, , drop = FALSE], 2, sd, na.rm = TRUE)
+    th.sd <- th * std.dev
+    
+    correlation <- matrix(1, n , n)
+    for (i in 1:(n-1)){
+        for (j in 2:n){
+            pos <- sum(
+                (R[,i] > th.sd[i] & R[,j] >= th.sd[j]) | (R[,i] <= -th.sd[i] & R[, j] <= -th.sd[j]),
+                na.rm = TRUE)
+            neg <- sum(
+                (R[,i] >= th.sd[i] & R[,j] <= -th.sd[j]) | (R[,i] <= -th.sd[i] & R[, j] >= th.sd[j]),
+                na.rm = TRUE)
+            correlation[i,j] <- (pos - neg) / (pos + neg)
+            correlation[j,i] <- (pos - neg) / (pos + neg)
+        }
+    }
+    
+    g.cov <- diag(std.dev) %*% correlation %*% diag(std.dev)
+    row.names(g.cov) <- colnames(R)
+    colnames(g.cov) <- colnames(R)
+    g.cov <- round(g.cov, 10)
+    return(g.cov)
+}
+
+
+mom_gerber <- function(R){
+    out <- mom(R, colMeans, function(x) gerber_cov(x, th = 0.5))
+    return(out)
+}
+
+portf_rbl <- function(momentFUN){
+    return(optimize.portfolio.rebalancing(
+        R, portfolio = init.portf, 
+        optimize_method = 'DEoptim',
+        momentFUN = momentFUN, 
+        trace = TRUE, 
+        rebalance_on = 'months', 
+        training_period = 60
+        ))
+}
+
+
+registerDoSEQ()
+
+mvc_ls_opt <- portf_rbl(momentFUN = 'mom_linshrink')
+
+mvc_nls_opt <- portf_rbl(momentFUN = 'mom_nlshrink')
+
+mvc_gerber_opt <- portf_rbl(momentFUN = 'mom_gerber')
+
+mvc_vt_opt <- portf_rbl(momentFUN = 'mom_vt')
+
+mvc_ls_ret <- Return.portfolio(
+    R, 
+    weights = extractWeights(mvc_ls_opt),
+    rebalance_on = 'months'
+    )
+
+mvc_nls_ret <- Return.portfolio(
+    R, 
+    weights = extractWeights(mvc_nls_opt),
+    rebalance_on = 'months'
+    )
+
+mvc_gerber_ret <- Return.portfolio(
+    R,
+    weights = extractWeights(mvc_gerber_opt),
+    rebalance_on = 'months'
+    )
+
+mvc_vt_ret <- Return.portfolio(R, 
+                               weights = extractWeights(mvc_vt_opt),
+                               rebalance_on = 'months'
+                               )
+
+# re-doing function for 10 assets
+transcost_vector_mvc <- matrix(transaction_costs[1:10], nrow = 1) # Fewer assets for MVC
+calculate_net_returns <- function(portf_opt, portf_ret,
+                                  transcosts = transcost_vector_mvc) {
+    asset_weights <- extractWeights(portf_opt)
+    weight_diffs <- abs(diff(asset_weights))
+    period_costs <- weight_diffs %*% t(transcosts)
+    
+    period_costs_xts <- xts(period_costs[-1], order.by = index(portf_ret))
+    
+    return(portf_ret - period_costs_xts)
+    
+}
+
+mvc_ls_ret_net <- calculate_net_returns(mvc_ls_opt, mvc_ls_ret)
+mvc_nls_ret_net <- calculate_net_returns(mvc_nls_opt, mvc_nls_ret)
+mvc_gerber_ret_net <- calculate_net_returns(mvc_gerber_opt, mvc_gerber_ret)
+mvc_vt_ret_net <- calculate_net_returns(mvc_vt_opt, mvc_vt_ret)
+
+
+
+portf_ret_mvc <- merge(mvc_ls_ret, mvc_nls_ret, mvc_gerber_ret, mvc_vt_ret, mvu_ret, one_n_ret)
+
+portf_ret_mvc_net <- merge(mvc_ls_ret_net, mvc_nls_ret_net, mvc_gerber_ret_net, mvc_vt_ret_net, mvu_ret_net, one_n_ret_net)
+
+colnames(portf_ret_mvc) <- c('MVC-LS', 'MVC-NLS', 'MVC-Gerber', 'MVC-VT', 'MVU', '1/N')
+colnames(portf_ret_mvc_net) <- c('MVC-LS', 'MVC-NLS', 'MVC-Gerber', 'MVC-VT', 'MVU', '1/N')
+```
+
+```{r mv-plot-2, warning = FALSE, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap = "\\label{fig:figs}Conditional Mean-Variance Performance"}
+charts.PerformanceSummary(
+    portf_ret_mvc,
+    lwd = 2,
+    main = 'Performance Comparision'
+    )
+
+charts.PerformanceSummary(
+    portf_ret_mvc_net,
+    lwd = 2,
+    main = 'Performance Comparision - Net of Transaction Costs'
+    )
+```
+
+## Penalised MV-Efficient Portfolios
+Given the noise inherent in estimating the means and covariance matrix, and the marked improvement seen from incorporating shrinkage into our weight estimation, it makes sense to try to estimate and shrink the weights directly. To do this, we use of the Britten-Jones (1999) result that mean-variance efficient weights can be obtained from the regression $\iota = R\beta + \varepsilon$ and estimate this using the following approaches, including for comparison the 1/N portfolio: 
+
+1. OLS
+2. Lasso
+3. Ridge
+4. Elastic Net
+
+We continue to use the framework described above, but we are forced to increase the length of our rolling window since, with 83 assets, a width of 60 gives an underdetermined system. To balance the trade-off between having reasonable degrees of freedom and a decent analysis period we set the width to 156, giving 10 years of out-of-sample results. The results, found in Figure \@ref(fig:penalised-regression-plot), show that there is a significant improvement from estimating the weights directly, but weight-regularisatoin is essential to produce sparser portfolios with reduced turnover.
+```{r penalised-efficient-portfolios, include = FALSE}
+returns_xts <- crsp_monthly %>% 
+    dplyr::select(permno, date, return) %>% 
+    filter(permno %in% selected_permnos) %>% 
+    pivot_wider(names_from = permno, values_from = return) %>%
+    tk_xts(date_var = date, select = -date)
+
+iota <- rep(1, nrow(returns_xts))
+
+perform_analysis <- function(model_type = c('ols', 'lasso', 'ridge', 'elasticnet'), returns_xts) {
+    if (model_type == "ols") {
+        model_fit <- lm(iota ~ returns_xts - 1, data = returns_xts)
+        weights <- coef(model_fit)
+    }
+    
+    if (model_type == 'lasso') {
+        model_fit <- enet(x = returns_xts, y = iota, lambda = 0, 
+                          intercept = FALSE, normalize = FALSE)
+        # extracts weights for assets that minimise Cp
+        weights <- model_fit$beta.pure[order(model_fit$Cp)[1], ]
+    }
+    if (model_type == 'ridge') {
+        model_fit <- lm.ridge(iota ~ returns_xts - 1, 
+                              data = returns_xts, 
+                              lambda = 100
+                              )
+        # extracting weights and adding asset names
+        weights <- coef(model_fit)
+        names(weights) <- colnames(returns_xts)
+    }
+    
+    if (model_type == 'elasticnet') {
+        model_fit <- enet(x = returns_xts, y = iota, lambda = 1, 
+                          intercept = FALSE, normalize = FALSE)
+        # extracts weights for assets that minimise Cp
+        weights <- model_fit$beta.pure[order(model_fit$Cp)[1], ]
+    }
+    
+    scaled_weights <- weights / sum(weights) 
+    
+    # Compute portfolio returns
+    portfolio_returns <- Return.portfolio(R = returns_xts, weights = scaled_weights, rebalance_on = 'months')
+    
+    # Performance metrics
+    performance_metrics <- rbind(
+        Mean = mean(portfolio_returns) * 12,
+        StdDev = sd(portfolio_returns) * sqrt(12),
+        SharpeRatio = SharpeRatio(portfolio_returns, annualize = TRUE, FUN = 'StdDev'),
+        ExpectedShortfall = ES(portfolio_returns),
+        Turnover = sum(abs(diff(scaled_weights))),
+        MaxDrawdown = maxDrawdown(portfolio_returns)
+  )
+  
+    list(performance_metrics = performance_metrics, portfolio_returns = portfolio_returns)
+}
+
+model_types <- c('ols', 'lasso', 'ridge', 'elasticnet')
+
+# Rolling Window Backtest #
+calculate_weights <- function(model_type = c('ols', 'lasso', 'ridge', 'elasticnet'),
+                              x_training, y_training) {
+    if (model_type == 'ols') {
+        model_fit <- lm(y_training ~ x_training - 1)
+        weights <- coef(model_fit)
+    
+    } else if (model_type == 'lasso') {
+        model_fit <- enet(x = x_training, y = y_training,
+                          lambda = 0, intercept = FALSE, normalize = FALSE)
+        weights <- model_fit$beta.pure[order(model_fit$Cp)[1], ]
+    
+    } else if (model_type == 'ridge') {
+        model_fit <- lm.ridge(y_training ~ x_training - 1, lambda = 100)
+        weights <- coef(model_fit)
+    
+    } else if (model_type == 'elasticnet') {
+        model_fit <- enet(x = x_training, y = y_training,
+                          lambda = 1, intercept = FALSE, normalize = FALSE)
+        weights <- model_fit$beta.pure[order(model_fit$Cp)[1], ]
+    }
+    
+    names(weights) <- colnames(x_training)
+    return(weights / sum(weights))  
+}
+
+# Rolling window function
+perform_rolling_analysis <- function(model_type, returns_xts, window_size = 156, net_returns = FALSE) {
+    analysis_start <- index(returns_xts)[window_size + 1]
+    rebalance_dates <- seq(from = analysis_start, to = end(returns_xts), by = "months")
+  
+    # Initialize an empty xts object for weights with correct dates
+    weights_xts <- xts(order.by = rebalance_dates)
+    weights_xts <- merge(weights_xts,
+        matrix(NA,
+               nrow = length(rebalance_dates),
+               ncol = ncol(returns_xts))
+        )
+    colnames(weights_xts) <- colnames(returns_xts)
+
+    for (end_date in rebalance_dates) {
+        # Extract the training data
+        x_training <- returns_xts[(which(index(returns_xts) == end_date) - window_size):which(index(returns_xts) == end_date),]
+        y_training <- rep(1, nrow(x_training))
+    
+        # Calculate weights using the specified model
+        weights <- calculate_weights(model_type, x_training, y_training)
+        weights <- weights / sum(weights)
+        
+        # Store the calculated weights in the xts object for the current rebalance date
+        weights_xts[index(weights_xts) == end_date, ] <- as.numeric(weights) 
+    }
+    # portfolio returns
+    weights_xts <- weights_xts[-1, ]
+    weights_xts <- na.approx(weights_xts, na.rm = FALSE)
+    weights_xts <- na.locf(weights_xts, na.rm = FALSE)
+    weights_xts <- na.locf(weights_xts, na.rm = FALSE, fromLast = TRUE)
+    portfolio_returns <- Return.portfolio(R = returns_xts, weights = weights_xts)
+    # transaction costs
+    weight_diffs <- abs(diff(weights_xts))
+    transaction_costs <- weight_diffs %*% t(transcost_vector)
+    transaction_costs <- xts(transaction_costs[-1], order.by = index(portfolio_returns))
+    
+    # Performance metrics
+    if (net_returns) {
+        portfolio_returns <- portfolio_returns - transaction_costs
+    }
+    performance_metrics <- rbind(
+        Mean = mean(portfolio_returns) * 12,
+        StdDev = sd(portfolio_returns) * sqrt(12),
+        SharpeRatio = SharpeRatio(portfolio_returns, annualize = TRUE, FUN = 'StdDev'),
+        ExpectedShortfall = ES(portfolio_returns),
+        Turnover = sum(abs(diff(weights_xts))[-1]),
+        MaxDrawdown = maxDrawdown(portfolio_returns)
+    )
+  
+    list(performance_metrics = performance_metrics, portfolio_returns = portfolio_returns, weights = weights_xts, transaction_costs = transaction_costs)
+    
+}
+
+# analysing results
+backtest_results <- lapply(model_types, function(x) perform_rolling_analysis(x, returns_xts))
+
+backtest_results_net <- lapply(model_types, function(x) perform_rolling_analysis(x, returns_xts, net_returns = TRUE))
+
+# Combine metrics into a single data frame 
+backtest_results_df <- do.call(cbind, lapply(backtest_results, function(result) result$performance_metrics)) %>% as.data.frame()
+colnames(backtest_results_df) <- model_types
+
+backtest_results_net_df <- do.call(cbind, lapply(backtest_results_net, function(result) result$performance_metrics)) %>% as.data.frame()
+colnames(backtest_results_net_df) <- model_types
+
+# create tibble to present results
+backtest_results_tbl <- tibble(
+    Metric = rownames(backtest_results_df),
+    backtest_results_df
+    ) %>% 
+    rename(OLS = ols) %>% 
+    mutate(across(where(is.numeric), ~ round(., 3)))
+
+backtest_results_net_tbl <- tibble(
+    Metric = rownames(backtest_results_net_df),
+    backtest_results_net_df
+    ) %>% 
+    rename(OLS = ols) %>% 
+    mutate(across(where(is.numeric), ~ round(., 3)))
+
+ 
+ols_ret <- backtest_results[[1]]$portfolio_returns
+lasso_ret <- backtest_results[[2]]$portfolio_returns
+ridge_ret <- backtest_results[[3]]$portfolio_returns
+elasticnet_ret <- backtest_results[[4]]$portfolio_returns
+one_n_ret <- Return.portfolio(returns_xts, rep(1/ncol(returns_xts), ncol(returns_xts)))
+
+ols_ret_net <- backtest_results_net[[1]]$portfolio_returns
+lasso_ret_net <- backtest_results_net[[2]]$portfolio_returns
+ridge_ret_net <- backtest_results_net[[3]]$portfolio_returns
+elasticnet_ret_net <- backtest_results_net[[4]]$portfolio_returns
+one_n_ret_net <- one_n_ret - (one_n_turnover * 0.0037)
+
+penalised_regression_ret <- merge(ols_ret, lasso_ret, ridge_ret, elasticnet_ret, one_n_ret) %>% na.omit()
+
+penalised_regression_ret_net <- merge(ols_ret_net, lasso_ret_net, ridge_ret_net, elasticnet_ret_net, one_n_ret_net) %>% na.omit()
+
+colnames(penalised_regression_ret) <- c('OLS', 'Lasso', 'Ridge', 'Elastic Net', '1/N')
+colnames(penalised_regression_ret_net) <- c('OLS', 'Lasso', 'Ridge', 'Elastic Net', '1/N')
+
+```
+
+```{r penalised-regression-plot, warning = FALSE, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap = "\\label{fig:figs}Penalised Regression Performance"}
+charts.PerformanceSummary(
+    penalised_regression_ret,
+    lwd = 2,
+    main = 'Performance Comparision'
+    )
+
+charts.PerformanceSummary(
+    penalised_regression_ret_net,
+    lwd = 2,
+    main = 'Performance Comparision - Net of Transaction Costs'
+    )
+```
+
+All penalised regressions markedly outperform OLS, which takes such aggressive positions that it makes a loss net of transaction costs, and the approaches which incorporate an $L_2$ penalty do better than those that don't. This is due to the quadratic norm smoothing the weights, which results in less turnover between periods; however, it is clear from the performance of the elasticnet portfolio that the sparsity induced by the $L_1$ penalty is complementary to this, and the combination produces the best result.
+
+We include in Table 3.1 the net results from these strategies, excluding an extended discussion for brevity. In short, all traditional approaches are comprehensively outperformed by an equal-weight portfolio for our set of assets in a mean-variance sense, and they suffer huge drawdowns in market downturns. Unsurprisingly, there is no identification or exploitation of market cycles visible in their performance. 
+
+
+```{r section-2-results, include = FALSE }
+mv_results <- function(weights, one_n = FALSE, net_returns = TRUE) {
+    if (one_n) {
+        portfolio_returns <- Return.portfolio(
+            R = returns_xts,
+            weights = rep(1/ncol(returns_xts), ncol(returns_xts)),
+            rebalance_on = "months")
+        portfolio_returns <- portfolio_returns - (10*one_n_turnover * 0.0037)
+    } else {
+        portfolio_returns <- Return.portfolio(R = returns_xts, weights, rebalance_on = 'months')
+        weight_diffs <- abs(diff(weights))
+        transaction_costs <- weight_diffs %*% t(transcost_vector)
+        transaction_costs <- xts(transaction_costs[-1], order.by = index(portfolio_returns))
+        if (net_returns) {
+            portfolio_returns <- portfolio_returns - transaction_costs
+    }
+    }
+    
+    performance_metrics <- rbind(
+        Mean = mean(portfolio_returns) * 12,
+        StdDev = sd(portfolio_returns) * sqrt(12),
+        SharpeRatio = SharpeRatio(portfolio_returns, annualize = TRUE, FUN = 'StdDev'),
+        ExpectedShortfall = ES(portfolio_returns),
+        Turnover = sum(abs(diff(weights))[-1]),
+        MaxDrawdown = maxDrawdown(portfolio_returns)
+    )
+  
+    list(performance_metrics = performance_metrics, portfolio_returns = portfolio_returns)
+    
+}
+
+mvc_results <- function(weights, one_n = FALSE, net_returns = TRUE) {
+    if (one_n) {
+        portfolio_returns <- Return.portfolio(
+            R = returns_xts,
+            weights = rep(1/ncol(returns_xts), ncol(returns_xts)),
+            rebalance_on = "months")
+        portfolio_returns <- portfolio_returns - (10*one_n_turnover * 0.0037)
+    } else {
+        portfolio_returns <- Return.portfolio(R = R, weights, rebalance_on = 'months')
+        weight_diffs <- abs(diff(weights))
+        transaction_costs <- weight_diffs %*% t(transcost_vector_mvc)
+        transaction_costs <- xts(transaction_costs[-1], order.by = index(portfolio_returns))
+        if (net_returns) {
+            portfolio_returns <- portfolio_returns - transaction_costs
+    }
+    }
+    
+    performance_metrics <- rbind(
+        Mean = mean(portfolio_returns) * 12,
+        StdDev = sd(portfolio_returns) * sqrt(12),
+        SharpeRatio = SharpeRatio(portfolio_returns, annualize = TRUE, FUN = 'StdDev'),
+        ExpectedShortfall = ES(portfolio_returns),
+        Turnover = sum(abs(diff(weights))[-1]),
+        MaxDrawdown = maxDrawdown(portfolio_returns)
+    )
+  
+    list(performance_metrics = performance_metrics, portfolio_returns = portfolio_returns)
+    
+}
+
+# one_n
+one_n_weights <- T
+one_n_results_net <- mv_results(one_n_weights, one_n = TRUE)
+one_n_results_net_df <- one_n_results_net$performance_metrics %>% as.data.frame()
+colnames(one_n_results_net_df) <- '1/N'
+
+# Unconditional MV
+mvu_models <- list(mvu_weights, mvc_weights, minvar_weights)
+mvu_names  <- c('MV-U', 'MV-C', 'Min-Var')
+mvu_results_net <- lapply(mvu_models, function(x) mv_results(x))
+
+mvu_results_net_df <- do.call(cbind, lapply(mvu_results_net, function(result) result$performance_metrics)) %>% as.data.frame()
+colnames(mvu_results_net_df) <- mvu_names
+rownames(mvu_results_net_df)[3] <- 'SharpeRatio'
+
+mvc_models <- lapply(list(mvc_ls_opt, mvc_nls_opt, mvc_gerber_opt, mvc_vt_opt), function(x) extractWeights(x))
+mvc_names <- c('MVC-LS', 'MVC-NLS', 'MVC-Gerber', 'MVC-VT')
+mvc_results_net <- lapply(mvc_models, function(x) mvc_results(x))
+
+mvc_results_net_df <- do.call(cbind, lapply(mvc_results_net, function(result) result$performance_metrics)) %>% as.data.frame()
+colnames(mvc_results_net_df) <- mvc_names
+
+one_n_results_net_tbl <- tibble(
+    one_n_results_net_df
+    )
+mvu_results_net_tbl <- tibble(
+    Metric = rownames(mvu_results_net_df),
+    mvu_results_net_df
+    )
+
+mvc_results_net_tbl <- tibble(
+    mvc_results_net_df
+    )
+
+mvc_results_net_tbl
+pr_results_net_tbl <- results_net_tbl <- tibble(
+    backtest_results_net_df
+    )
+
+section2_results_tbl <- tibble(mvu_results_net_tbl, mvc_results_net_tbl, pr_results_net_tbl, one_n_results_net_tbl) %>% 
+    rename(OLS = ols, Lasso = lasso, Ridge = ridge, ENET = elasticnet) %>% 
+    mutate(across(where(is.numeric), ~ round(., 3)))
+
+rm(mvc_ls_opt, mvc_nls_opt, mvc_gerber_opt, mvc_vt_opt)
+```
+
+```{r output-section2-table, echo = FALSE}
+test <- knitr::kable(section2_results_tbl, format = "latex", booktabs = TRUE, caption = 'Results: Net of Transaction Costs') %>%
+    kable_styling(full_width = TRUE, position = "center")
+
+cat(test)
+```
+
+# Prediction & Signal Generation
+
+We now move to significantly improve upon the methods covered in the previous section by forming conditional forecasts of the expected returns of our assets using modern statistical tools and a wide range of potential features. We construct our baseline feature dataset from the following sources, in each case analysing the number of missing values for each characteristic and retaining only those that are missing fewer than 1% of their values for our selected assets: 
+
+1. CRSP: all 71 asset-specific fundamentals $\rightarrow$ 45 monthly-frequency characteristics retained
+2. Compustat: all 22 asset-specific 'informative fundamentals' $\rightarrow$ 14 quarterly-frequency characteristics retained
+
+We impute our feature data using cubic spline interpolation (within-assets) to account for the remaining missing values. This approach is markedly more efficient than only preserving complete cases à la na.omit() - despite restricting our attention to characteristics with <1% missing values, taking the union of non-missing observations results in dropping a significant fraction of the data (not to mention losing its coherence as a time series). The way in which we accommodate the merging of the monthly and quarterly series depends on the frequency at which we intend to implement the forecasting/portfolio constriction: we form a monthly dataset using LOCF on the quarterly data and a quarterly equivalent by simply using the last monthly observation in each quarter.
+
+Finally, we standardise our data in two dimensions. The first, following Brandt & Santa-Clara (2009), is a cross-sectional standardisation across all assets at each date. The important consequence of this is that our standardised features are stationary, while the originals are almost certainly not, which is important when using any linear regression-based models. The second is a longitudinal/temporal standardisation for each feature, to ensure proper functioning and improve convergence speed of the ML optimisation algorithms we use later. Most obviously this applies to the SGD-type optimisers we use for our neural networks, but also has implications for the PCR/PLS-based strategies we employ. Obviously, we lag the feature data by one period before joining it to the excess return data for our assets.
+
+We summarise the prediction methods we use and their hyperparameter selection below. As before, we are unfortunately forced to be brief, full detail can be found in lines 1650-1950 of the RMd. 
+
+1. OLS 
+
+2. Lasso: tuned using cv.glmnet to select $\lambda_{min}$ with the lowest cross-validation MSE
+
+3. Elastic Net: tuned using cv.glmnet to select $\lambda_{min}$ with the lowest cross-validation MSE
+
+4. PCR:  tuned using pcr's validation argument to select *ncomp* with the lowest cross-validation MSE
+
+5. PLS: tuned using the plsr's validation argument to select *ncomp* with lowest cross-validation MSE
+
+6. RF: tuned using a parameter grid with caret since ranger does not have inbuilt hyperparameter tuning, but randomForest is hopelessly slow. Lowest cross-validation MSE given by: *num.trees = 1000, mtry = 9, min.node.size = 10, max.depth = NULL*. 
+
+7. GBRT:  tuned using a parameter grid in combination with xgb.cv for its early-stopping and k-fold cv capabilities. Lowest cross-validation MSE given by: *eta = 0.01,  max_depth = 8, subsample = 1, min_child_weight = 10, nrounds = 532*.
+
+7. NN[1:5]:  optimised using 'adam' algorithm with *learning_rate = 0.001*, ReLU activations for all hidden layers and, for reasons that should become clear, linear activation for the output layer. While the specific regularisation depends on the network the general approach is as follows: mild $l_{1}$ and $l_{2}$ penalisation in combination with dropout (rate = 0.3) on the upper layer; $l_{2}$ penalisation in combination with dropout on the middle layers; $l_{2}$ penalisation on the deeper layers. This produces well-behaved networks reluctant to overfit, with consistent OOS prediction across a wide range of complexities. (*Full specifications can be found on lines 1830-1960*.)
+
+```{r kelly-models, include = FALSE }
+# interpolate and standardise feature data
+preprocess_data <- function(data) {
+    data %>%
+        arrange(date, permno) %>% 
+        dplyr::select(-return, -ret_excess, -open, -high, -low, -close, -shrout, -rf, -sp500ret, -mkt_excess, -smb, -hml, -rmw, -cma) %>%
+        filter(permno %in% selected_permnos) %>%
+        mutate(date = date %m+% months(1)) %>%
+        group_by(permno) %>%
+        mutate(across(.cols = where(is.numeric), .fns = ~na.spline(.x, na.rm = FALSE))) %>%
+        mutate(across(.cols = where(is.numeric), .fns = ~na.locf(.x, na.rm = FALSE))) %>%
+        mutate(across(.cols = where(is.numeric), .fns = ~na.locf(.x, fromLast = TRUE, na.rm = FALSE))) %>%
+        ungroup() %>%
+        group_by(date) %>%
+        mutate_at(vars(-date, -permno), 
+                  ~ (. - mean(.)) / sd(.)) %>%
+        ungroup() %>%
+        group_by(permno) %>%
+        mutate_at(vars(-date, -permno), ~ (. - mean(.)) / sd(.)) %>%
+        ungroup()
+}
+
+split_data <- function(data, train_end, cv_end) {
+    ml_training <- filter(data, date < train_end) %>% dplyr::select(-date, -permno)
+    ml_cv <- filter(data, date >= train_end & date < cv_end) %>% dplyr::select(-date, -permno)
+    ml_test <- filter(data, date >= cv_end) %>% dplyr::select(-date, -permno)
+    
+    list(training = ml_training, validation = ml_cv, test = ml_test)
+}
+
+fit_ols_model <- function(train_data, cv_data, test_data) {
+    ols_fit <- lm(formula = ret_excess ~ ., data = train_data)
+    
+    pred_cv <- predict(ols_fit, newdata = cv_data)
+    pred_test <- predict(ols_fit, newdata = test_data)
+    
+    list(model = ols_fit, val_predictions = pred_cv, test_predictions = pred_test)
+}
+
+evaluate_model <- function(actual, predictions) {
+  rmse <- sqrt(mean((predictions - actual)^2))
+  r_squared <- summary(lm(predictions ~ actual))$r.squared
+  
+  list(RMSE = rmse, R2 = r_squared)
+}
+
+fit_lasso_model <- function(train_data, cv_data, test_data, alpha = 1) {
+    x_train <- as.matrix(model.matrix(ret_excess ~ ., data = train_data))
+    y_train <- train_data$ret_excess
+    
+    x_cv <- as.matrix(model.matrix(ret_excess ~ ., data = cv_data))
+    y_cv <- cv_data$ret_excess
+    
+    x_test <- as.matrix(model.matrix(ret_excess ~ ., data = test_data))
+    y_test <- test_data$ret_excess
+    
+    lasso_fit <- glmnet(x_train, y_train, alpha = alpha, family = "gaussian")
+    
+    # optimal lambda using cross-validation
+    cv_lasso <- cv.glmnet(x_train, y_train, alpha = alpha, family = "gaussian")
+    
+    pred_cv <- predict(cv_lasso, s = "lambda.min", newx = x_cv)
+    pred_test <- predict(cv_lasso, s = "lambda.min", newx = x_test)
+    
+    list(model = lasso_fit, cv_model = cv_lasso, cv_predictions = pred_cv, test_predictions = pred_test)
+}
+
+fit_elastic_net_model <- function(train_data, cv_data, test_data, alpha = 0.5) {
+    x_train <- as.matrix(model.matrix(ret_excess ~ ., data = train_data))
+    y_train <- train_data$ret_excess
+    
+    x_cv <- as.matrix(model.matrix(ret_excess ~ ., data = cv_data))
+    y_cv <- cv_data$ret_excess
+    
+    x_test <- as.matrix(model.matrix(ret_excess ~ ., data = test_data))
+    y_test <- test_data$ret_excess
+    
+    elastic_net_fit <- glmnet(x_train, y_train, alpha = alpha, family = "gaussian")
+    
+    # optimal lambda using cross-validation
+    cv_elastic_net <- cv.glmnet(x_train, y_train, alpha = alpha, family = "gaussian")
+    
+    pred_cv <- predict(cv_elastic_net, s = "lambda.min", newx = x_cv)
+    pred_test <- predict(cv_elastic_net, s = "lambda.min", newx = x_test)
+    
+    list(model = elastic_net_fit, cv_model = cv_elastic_net, cv_predictions = pred_cv, test_predictions = pred_test)
+}
+
+fit_pcr_model <- function(train_data, cv_data, test_data, ncomp) {
+    pcr_fit <- pcr(ret_excess ~., data = train_data, validation = "none", ncomp = ncomp)
+    
+    pred_cv <- predict(pcr_fit, newdata = cv_data, ncomp = ncomp)
+    pred_test <- predict(pcr_fit, newdata = test_data, ncomp = ncomp)
+    
+    list(model = pcr_fit, cv_predictions = pred_cv, test_predictions = pred_test)
+}
+
+fit_pls_model <- function(train_data, cv_data, test_data, ncomp) {
+  pls_fit <- plsr(ret_excess ~ ., data = train_data, validation = "none", ncomp = ncomp)
+  
+  pred_cv <- predict(pls_fit, newdata = cv_data, ncomp = ncomp)
+  pred_test <- predict(pls_fit, newdata = test_data, ncomp = ncomp)
+  
+  list(model = pls_fit, cv_predictions = pred_cv, test_predictions = pred_test)
+}
+
+fit_rf_model <- function(train_data, cv_data, test_data) {
+    rf_fit <- ranger(
+        ret_excess ~ ., 
+        data = train_data, 
+        num.trees = 1000,
+        mtry = 9,
+        min.node.size = 10, 
+        splitrule = 'variance'
+    )
+
+    pred_cv <- predict(rf_fit, data = cv_data)$predictions
+    pred_test <- predict(rf_fit, data = test_data)$predictions
+    
+    list(model = rf_fit, val_predictions = pred_cv, test_predictions = pred_test)
+}
+
+fit_xgb_model <- function(train_data, cv_data, test_data) {
+    train_matrix <- as.matrix(train_data[,-1])
+    train_label <- train_data$ret_excess
+    
+    cv_matrix <- as.matrix(cv_data[,-1])
+    cv_label <- cv_data$ret_excess
+    
+    test_matrix <- as.matrix(test_data[,-1])
+    
+    params <- list(
+        objective = "reg:squarederror",
+        eta = 0.01,
+        max_depth = 8, 
+        min_child_weight = 10,
+        subsample = 1
+    )
+    
+    nrounds <- 500
+    
+    xgb_fit <- xgboost(
+        data = train_matrix, 
+        label = train_label, 
+        params = params, 
+        nrounds = nrounds,
+        verbose = 1
+    )
+    
+    pred_cv <- predict(xgb_fit, newdata = cv_matrix)
+    pred_test <- predict(xgb_fit, newdata = test_matrix)
+    
+    list(model = xgb_fit, val_predictions = pred_cv, test_predictions = pred_test)
+}
+
+fit_nn_model <- function(model, train_data, cv_data, test_data, epochs = 100) {
+    x_train <- as.matrix(model.matrix(ret_excess ~ ., data = train_data))
+    y_train <- train_data$ret_excess
+    
+    x_cv <- as.matrix(model.matrix(ret_excess ~ ., data = cv_data))
+    y_cv <- cv_data$ret_excess
+    
+    x_test <- as.matrix(model.matrix(ret_excess ~ ., data = test_data))
+    y_test <- test_data$ret_excess
+    
+    history <- model %>% fit(
+        x_train, y_train,
+        epochs = epochs,
+        batch_size = 32,
+        validation_data = list(x_cv, y_cv)
+    )
+    
+    pred_cv <- predict(model, x_cv)
+    pred_test <- predict(model, x_test)
+    
+    list(
+        model = model, 
+        history = history, 
+        cv_predictions = pred_cv, 
+        test_predictions = pred_test
+    )
+}
+
+features <- preprocess_data(crsp_monthly)
+
+ml_data <- crsp_monthly %>%
+    dplyr::select(permno, date, ret_excess) %>%
+    inner_join(features,
+               join_by(permno, date),
+               suffix = c('', '_l')
+               ) 
+
+test_data <- split_data(ml_data, '2010-01-01', '2012-01-01')
+
+ols_test <- fit_ols_model(test_data$training, test_data$validation, test_data$test)
+ols_evaluation <- evaluate_model(test_data$test$ret_excess, ols_test$test_predictions)
+
+lasso_test <- fit_lasso_model(test_data$training, test_data$validation, test_data$test)
+lasso_evaluation <- evaluate_model(test_data$test$ret_excess, lasso_test$test_predictions)
+
+elastic_net_test <- fit_elastic_net_model(test_data$training, test_data$validation, test_data$test)
+
+elastic_net_evaluation <- evaluate_model(test_data$test$ret_excess, elastic_net_test$test_predictions)
+
+pcr_test <- fit_pcr_model(test_data$training, test_data$validation, test_data$test, ncomp = 10)
+pcr_evaluation <- evaluate_model(test_data$test$ret_excess, pcr_test$test_predictions)
+
+pls_test <- fit_pls_model(test_data$training, test_data$validation, test_data$test, ncomp = 10)
+pls_evaluation <- evaluate_model(test_data$test$ret_excess, pls_test$test_predictions)
+
+rf_test <- fit_rf_model(test_data$training, test_data$validation, test_data$test)
+rf_evaluation <- evaluate_model(test_data$test$ret_excess, rf_test$test_predictions)
+
+xgb_test <- fit_xgb_model(test_data$training, test_data$validation, test_data$test)
+xgb_evaluation <- evaluate_model(test_data$test$ret_excess, xgb_test$test_predictions)
+
+NN1 <- keras_model_sequential() %>%
+  layer_dense(units = 32,
+              activation = 'relu',
+              input_shape = ncol(test_data$training), 
+              kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+              ) %>%
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn1_test <- fit_nn_model(NN1, test_data$training, test_data$validation, test_data$test, epochs = 50) 
+nn1_evaluation <- evaluate_model(test_data$test$ret_excess, nn1_test$test_predictions)
+
+NN2 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn2_test <- fit_nn_model(NN2, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn2_evaluation <- evaluate_model(test_data$test$ret_excess, nn2_test$test_predictions)
+
+NN3 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dense(units = 8, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn3_test <- fit_nn_model(NN3, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn3_evaluation <- evaluate_model(test_data$test$ret_excess, nn3_test$test_predictions)
+
+NN4 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>% 
+    layer_dense(units = 8, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 4, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn4_test <- fit_nn_model(NN4, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn4_evaluation <- evaluate_model(test_data$test$ret_excess, nn4_test$test_predictions)
+
+NN5 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>% 
+    layer_dense(units = 8, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 4, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 2, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn5_test <- fit_nn_model(NN5, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn5_evaluation <- evaluate_model(test_data$test$ret_excess, nn5_test$test_predictions)
+
+
+```
+
+```{r forecast-results, include = FALSE }
+calculate_R2_oos <- function(actual, predicted) {
+    R2_oos <- 1 - sum((actual - predicted)^2) / sum((actual)^2)
+    
+    return(R2_oos)
+}
+
+perform_DM_test <- function(actual, model_1_predicted, model_2_predicted) {
+    e1 <- actual - model_1_predicted
+    e2 <- actual - model_2_predicted
+    
+    dm_test_result <- dm.test(e1, e2, alternative = 'greater', h = 1)
+    
+    return(dm_test_result) 
+}
+
+
+evaluate_performance <- function(actual, predictions_list, model_names) {
+    R2_oos_list <- sapply(predictions_list,
+                          function(x) calculate_R2_oos(actual, x) %>% round(digits = 5))
+    
+    dm_matrix <- matrix('', nrow = length(model_names), ncol = length(model_names), 
+                        dimnames = list(model_names, model_names))
+    
+    for (i in 1:(length(model_names) - 1)) {
+        for (j in (i + 1):length(model_names)) {
+            dm_test_result <- perform_DM_test(actual, predictions_list[[i]], predictions_list[[j]])
+            statistic <- dm_test_result$statistic %>% as.numeric()
+            p_value <- dm_test_result$p.value %>% as.numeric()
+            
+            if (p_value < 0.05) {
+                dm_matrix[i, j] <- paste0("**", round(statistic, 3), "**")
+            } else {
+                dm_matrix[i, j] <- round(statistic, 3)
+            }
+        }
+    }
+    diag(dm_matrix) <- '-'
+    list(R2_oos = setNames(R2_oos_list, model_names), DM_matrix = dm_matrix)
+}
+
+
+predictions_list <- list(
+    ols_test$test_predictions,
+    lasso_test$test_predictions,
+    elastic_net_test$test_predictions,
+    pcr_test$test_predictions,
+    pls_test$test_predictions,
+    rf_test$test_predictions,
+    xgb_test$test_predictions,
+    nn1_test$test_predictions,
+    nn2_test$test_predictions,
+    nn3_test$test_predictions,
+    nn4_test$test_predictions,
+    nn5_test$test_predictions
+    )
+
+model_names <- c(
+    "OLS",
+    "Lasso",
+    "ENet",
+    "PCR",
+    "PLS",
+    "RF",
+    "GBRT",
+    "NN1",
+    "NN2",
+    "NN3",
+    "NN4",
+    "NN5"
+    )
+
+forecast_results <- evaluate_performance(test_data$test$ret_excess, predictions_list, model_names)
+
+R2_oos_values <- forecast_results$R2_oos * 100 
+names(R2_oos_values) <- NULL
+
+DM_matrix <- forecast_results$DM_matrix
+
+forecast_results_table <- do.call(rbind, list(R2_oos_values, 
+        DM_matrix))
+
+```
+We present in Table \@ref(tab:output-forecast-table) statistical tests of relative forecasting ability for each of our models. The first row of the corresponds to the out-of-sample $R^{2}$ for each model, while the upper-triangular matrix below corresponds to one-sided Diebold-Mariano tests of equal predictive accuracy for the column-model against the row-model, with the DM statistics that imply a rejection of the null at the 5% level in bold. 
+
+```{r output-forecast-table, echo = FALSE}
+knitr::kable(forecast_results_table, format = "latex", caption = 'Monthly out-of-sample Prediction Performance') %>%
+    kable_styling(full_width = TRUE, position = "center")
+```
+
+The first thing we see is that the $R^{2}_{OOS}$ is generally increasing in the 'sophistication' of the models. Furthermore, in a Diebold-Mariano sense, we are able to significantly improve on the OLS performance using the more advanced statistical methods, with OLS statistically outperformed by Lasso, ENet and NN1-5. The best performing models are the neural networks, and we can see that there is a return to additional complexity, but only up to a point; neither the NN4 or NN5 models are able to outperform the NN3 despite their additional hidden layers. In light of this, as we move on to forming our return-timing portfolios, we drop the NN4 and NN5 models since repeatedly re-training them is time-consuming and they do not appear to offer any additional performance over the more parsimonious NN3 model.  
+
+```{r kelly-porfolio-construction, include = FALSE }
+# test period begins 2012-01-01
+start_date <- as.Date('2012-01-01')
+
+
+predictions_to_weights <- function(predictions, start_date,
+                                   num_assets = 83, long_only = FALSE) {
+    num_periods <- length(predictions) / num_assets
+
+    pred_matrix <- matrix(predictions, ncol = num_assets, byrow = TRUE)
+    
+    predictions_xts <- xts(
+        pred_matrix, 
+        order.by = seq(from = start_date, by = "month", length.out = num_periods)
+        )
+    colnames(predictions_xts) <- selected_permnos
+
+    weights_xts <- matrix(0, ncol = num_assets, nrow = num_periods) %>%
+        xts(., order.by = index(predictions_xts))
+    colnames(weights_xts) <- selected_permnos
+    
+    for(i in 1:nrow(predictions_xts)) {
+        monthly_predictions <- predictions_xts[i, ]
+        
+        long_indices <- order(monthly_predictions, decreasing = TRUE)[1:floor(num_assets * 0.1)]
+        short_indices <- order(monthly_predictions, decreasing = FALSE)[1:floor(num_assets * 0.1)]
+        
+        weights_xts[i, long_indices] <- 1 / length(long_indices)
+        weights_xts[i, short_indices] <- -1 / length(short_indices)
+    }
+    if (long_only) {
+        weights_xts <- pmax(weights_xts, 0)
+    }
+    return(list(predictions_xts = predictions_xts, weights_xts = weights_xts))
+}
+
+# computing weights for all strategies
+predictions_weights_ls <- lapply(predictions_list, function(preds) {
+    predictions_to_weights(predictions = preds, num_assets = 83, start_date = start_date)
+})
+
+predictions_weights_l <- lapply(predictions_list, function(preds) {
+    predictions_to_weights(predictions = preds, num_assets = 83, start_date = start_date, long_only = TRUE)
+})
+
+names(predictions_weights_ls) <- c("OLS", "Lasso", "ENet", "PCR", "PLS", "RF", "GBRT", "NN1", "NN2", "NN3", "NN4", "NN5")
+names(predictions_weights_l) <- c("OLS", "Lasso", "ENet", "PCR", "PLS", "RF", "GBRT", "NN1", "NN2", "NN3", "NN4", "NN5")
+
+evaluate_model_performance <- function(predictions_weights, R = returns_xts, transcost_vector, net_returns = FALSE) {
+    portfolio_returns_and_metrics_list <- lapply(predictions_weights, function(weights_info) {
+        weights_xts <- weights_info$weights_xts
+        portfolio_returns <- Return.portfolio(R = R,
+                                              weights = weights_xts,
+                                              rebalance_on = "months"
+        )
+        
+        if (net_returns) {
+            weight_diffs <- abs(diff(weights_xts))
+            transaction_costs <- weight_diffs %*% t(transcost_vector)
+            transaction_costs <- xts(transaction_costs[-1], order.by = index(portfolio_returns))
+
+            portfolio_returns <- portfolio_returns - transaction_costs
+        }
+        
+        performance_metrics <- tibble(
+            Mean = mean(portfolio_returns) * 12,
+            StdDev = sd(portfolio_returns) * sqrt(12),
+            SharpeRatio = SharpeRatio(portfolio_returns, annualize = TRUE, FUN = 'StdDev'),
+            ExpectedShortfall = ES(portfolio_returns),
+            Turnover = sum(abs(diff(weights_xts))[-1]), 
+            MaxDrawdown = maxDrawdown(portfolio_returns)
+        )
+        
+        list(portfolio_returns = portfolio_returns, performance_metrics = performance_metrics)
+    })
+    
+    names(portfolio_returns_and_metrics_list) <- names(predictions_weights)
+    
+    merged_portfolio_returns <- do.call(merge, lapply(portfolio_returns_and_metrics_list, `[[`, "portfolio_returns"))
+    
+    performance_metrics_list <- lapply(portfolio_returns_and_metrics_list, `[[`, "performance_metrics")
+    performance_metrics_df <- bind_rows(performance_metrics_list, .id = "Model") %>%
+        pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value") %>%
+        pivot_wider(names_from = Model, values_from = Value) %>% 
+        mutate(across(where(is.numeric), ~ round(., 3)))
+    
+    names(merged_portfolio_returns) <- names(predictions_weights)
+    
+    return(list(merged_portfolio_returns = merged_portfolio_returns,
+                performance_metrics_df = performance_metrics_df)
+    )
+}
+
+# gross returns
+results_ls <- evaluate_model_performance(predictions_weights_ls)
+portfolio_returns_ls <- results_ls$merged_portfolio_returns
+performance_metrics_df_ls <- results_ls$performance_metrics_df
+
+results_l <- evaluate_model_performance(predictions_weights_l)
+portfolio_returns_l <- results_l$merged_portfolio_returns
+performance_metrics_df_l <- results_l$performance_metrics_df
+
+# net returns 
+net_results_ls <- evaluate_model_performance(predictions_weights_ls, transcost_vector = transcost_vector, net_returns = TRUE)
+portfolio_returns_ls_net <- net_results_ls$merged_portfolio_returns
+performance_metrics_df_ls_net <- net_results_ls$performance_metrics_df
+
+net_results_l <- evaluate_model_performance(predictions_weights_l, transcost_vector = transcost_vector, net_returns = TRUE)
+portfolio_returns_l_net <- net_results_l$merged_portfolio_returns
+performance_metrics_df_l_net <- net_results_l$performance_metrics_df
+
+
+```
+
+# Portfolio Construction 
+We now proceed to form return-timing portfolios using the predictions of the models above. Once again, *full details of the approach can be found on lines 2070-2180* but a summary is as follows: for each model, we train it on the data from 2000-01-01 to 2010-01-01 and use 2010-01-01 to 2012-01-01 for cross-validation. We then roll through the test data, predicting the returns from the features, and (using the fact that we previously sorted our data by permno and date) are able to transform the unnamed, long predictions vector into an xts object of predictions for each asset at each date by considering the outputted predictions mod 83. The merits to this approach are twofold - from here it is straightforward to form arbitrary n-tile return-timing portfolios by simple operations on the rows of the matrix, as well as having effectively plugged ourself back into the Portfolio/PerformanceAnalytics world and all of its features (and we can continue to use our matrix multiplication approach on the weights matrix to calculate net returns).
+
+In order to answer the question of whether the use of machine-learning models leads to portfolios that outperform traditional approaches *specifically* through the identification and exploitation of market cycles we construct two different sets of portfolios: the first implements return-timing with a long-only decile portfolio with predictions using only the features discussed above; the second augments the features data with a range of macroeconomic variables and sentiment indices. The idea is to try and separate the essence of the question, which is whether the outperformance is driven *specifically* by the identification of market cycles, from the more general observation of outperformance. ^[*we also have fully working and estimated long/short decile portfolios in the RMd file, but sadly not the word count to discuss them. I focus on the long-only portfolios here because the exposition of market-cycle identification is more exposed.*]
+
+We present in Figure \@ref(fig:kelly-plots) the results for the long-only decile portfolios without the macroeconomic and sentiment features. The neural networks, random forest and GBRT perform by far the best out of the strategies, both gross and net of transaction costs. With comparison to our earlier figures, one can also see that our return-timing ML portfolios utterly destroy the 1/N portfolio in gross returns, and beat it modestly in net returns; this advantage is only extended by mitigating transaction costs, either simply rebalancing quarterly or conditioning on the previous periods weights *(as in Di Miguel et. al, 2015)*, but is not the focus of this paper. 
+
+```{r kelly-plots, warning = FALSE, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap = "\\label{fig:figs}ML Strategy Performance  without Macro and Sentiment Indices"}
+charts.PerformanceSummary(
+    portfolio_returns_l,
+    lwd = 2,
+    main = 'Long-Only Portfolios'
+    )
+
+charts.PerformanceSummary(
+    portfolio_returns_l_net,
+    lwd = 2,
+    main = 'Long-Only Portfolios (Net)'
+    )
+```
+
+```{r kelly-with-macro, include = FALSE }
+# merge macro data
+ml_data <- crsp_monthly %>%
+    dplyr::select(permno, date, ret_excess) %>%
+    inner_join(features,
+               join_by(permno, date),
+               suffix = c('', '_l') 
+    ) %>% 
+    left_join(macro_sentiment_monthly, by = join_by(date))
+
+test_data <- split_data(ml_data, '2010-01-01', '2012-01-01')
+
+ols_test <- fit_ols_model(test_data$training, test_data$validation, test_data$test)
+ols_evaluation <- evaluate_model(test_data$test$ret_excess, ols_test$test_predictions)
+
+lasso_test <- fit_lasso_model(test_data$training, test_data$validation, test_data$test)
+lasso_evaluation <- evaluate_model(test_data$test$ret_excess, lasso_test$test_predictions)
+
+elastic_net_test <- fit_elastic_net_model(test_data$training, test_data$validation, test_data$test)
+
+elastic_net_evaluation <- evaluate_model(test_data$test$ret_excess, elastic_net_test$test_predictions)
+
+pcr_test <- fit_pcr_model(test_data$training, test_data$validation, test_data$test, ncomp = 15)
+pcr_evaluation <- evaluate_model(test_data$test$ret_excess, pcr_test$test_predictions)
+
+pls_test <- fit_pls_model(test_data$training, test_data$validation, test_data$test, ncomp = 15)
+pls_evaluation <- evaluate_model(test_data$test$ret_excess, pls_test$test_predictions)
+
+rf_test <- fit_rf_model(test_data$training, test_data$validation, test_data$test)
+rf_evaluation <- evaluate_model(test_data$test$ret_excess, rf_test$test_predictions)
+
+xgb_test <- fit_xgb_model(test_data$training, test_data$validation, test_data$test)
+xgb_evaluation <- evaluate_model(test_data$test$ret_excess, xgb_test$test_predictions)
+
+keras::k_clear_session()
+
+NN1 <- keras_model_sequential() %>%
+  layer_dense(units = 32,
+              activation = 'relu',
+              input_shape = ncol(test_data$training), 
+              kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+              ) %>%
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn1_test <- fit_nn_model(NN1, test_data$training, test_data$validation, test_data$test, epochs = 50) 
+nn1_evaluation <- evaluate_model(test_data$test$ret_excess, nn1_test$test_predictions)
+
+NN2 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn2_test <- fit_nn_model(NN2, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn2_evaluation <- evaluate_model(test_data$test$ret_excess, nn2_test$test_predictions)
+
+NN3 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dense(units = 8, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn3_test <- fit_nn_model(NN3, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn3_evaluation <- evaluate_model(test_data$test$ret_excess, nn3_test$test_predictions)
+
+NN4 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>% 
+    layer_dense(units = 8, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 4, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn4_test <- fit_nn_model(NN4, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn4_evaluation <- evaluate_model(test_data$test$ret_excess, nn4_test$test_predictions)
+
+NN5 <- keras_model_sequential() %>%
+    layer_dense(units = 32,
+                activation = 'relu',
+                input_shape = ncol(test_data$training),
+                kernel_regularizer = regularizer_l1_l2(l1 = 0.001, l2 = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 16,
+                activation = 'relu',
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>%
+    layer_dropout(rate = 0.3) %>% 
+    layer_dense(units = 8, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 4, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 2, 
+                activation = 'relu', 
+                kernel_regularizer = regularizer_l2(l = 0.001)
+                ) %>% 
+    layer_dense(units = 1,
+                activation = 'linear'
+                ) %>%
+    compile(loss = 'mse',
+             optimizer = optimizer_adam(learning_rate = 0.001),
+             metrics = c('mean_absolute_error')
+             )
+
+nn5_test <- fit_nn_model(NN5, test_data$training, test_data$validation, test_data$test, epochs = 50)
+nn5_evaluation <- evaluate_model(test_data$test$ret_excess, nn5_test$test_predictions)
+
+
+predictions_list <- list(
+    ols_test$test_predictions,
+    lasso_test$test_predictions,
+    elastic_net_test$test_predictions,
+    pcr_test$test_predictions,
+    pls_test$test_predictions,
+    rf_test$test_predictions,
+    xgb_test$test_predictions,
+    nn1_test$test_predictions,
+    nn2_test$test_predictions,
+    nn3_test$test_predictions,
+    nn4_test$test_predictions,
+    nn5_test$test_predictions
+    )
+
+model_names <- c(
+    "OLS",
+    "Lasso",
+    "ENet",
+    "PCR",
+    "PLS",
+    "RF",
+    "GBRT",
+    "NN1",
+    "NN2",
+    "NN3",
+    "NN4",
+    "NN5"
+    )
+
+# computing weights for all strategies
+predictions_weights_ls <- lapply(predictions_list, function(preds) {
+    predictions_to_weights(predictions = preds, num_assets = 83, start_date = start_date)
+})
+
+predictions_weights_l <- lapply(predictions_list, function(preds) {
+    predictions_to_weights(predictions = preds, num_assets = 83, start_date = start_date, long_only = TRUE)
+})
+
+names(predictions_weights_ls) <- c("OLS", "Lasso", "ENet", "PCR", "PLS", "RF", "GBRT", "NN1", "NN2", "NN3", "NN4", "NN5")
+names(predictions_weights_l) <- c("OLS", "Lasso", "ENet", "PCR", "PLS", "RF", "GBRT", "NN1", "NN2", "NN3", "NN4", "NN5")
+
+# gross returns
+results_ls <- evaluate_model_performance(predictions_weights_ls)
+portfolio_returns_ls <- results_ls$merged_portfolio_returns
+performance_metrics_df_ls <- results_ls$performance_metrics_df
+
+results_l <- evaluate_model_performance(predictions_weights_l)
+portfolio_returns_l <- results_l$merged_portfolio_returns
+performance_metrics_df_l <- results_l$performance_metrics_df
+
+# net returns 
+net_results_ls <- evaluate_model_performance(predictions_weights_ls, transcost_vector = transcost_vector, net_returns = TRUE)
+portfolio_returns_ls_net <- net_results_ls$merged_portfolio_returns
+performance_metrics_df_ls_net <- net_results_ls$performance_metrics_df
+
+net_results_l <- evaluate_model_performance(predictions_weights_l, transcost_vector = transcost_vector, net_returns = TRUE)
+portfolio_returns_l_net <- net_results_l$merged_portfolio_returns
+performance_metrics_df_l_net <- net_results_l$performance_metrics_df
+
+```
+
+In Figure \@ref(fig:kelly-macro-plots) we can see that including the Macroeconomic variable and Sentiment Indices has a positive outcome, particularly for the neural networks and particularly for net returns. The other models are also generally improved by the addition, but nowhere near to the extent that the neural networks are. It is not entirely one-way, however; the GBRT model is significantly worsened by the addition. Upon investigation, it does not seem to be an issue of overfitting *per se* (and we did not change the parameters), but rather that the gradient boosting algorithm struggles to cope with the addition of characteristics which are the same across all stocks in each period when predicting individual stock returns due to the way in which it forms predictions.
+
+```{r kelly-macro-plots, warning = FALSE, echo = FALSE, fig.show = 'hold', fig.align = 'center', out.width = '50%', fig.cap = "\\label{fig:figs}ML Strategy Performance with Macro and Sentiment Indices"}
+charts.PerformanceSummary(
+    portfolio_returns_l,
+    lwd = 2,
+    main = 'Long-Only Portfolios'
+    )
+
+charts.PerformanceSummary(
+    portfolio_returns_l_net,
+    lwd = 2,
+    main = 'Long-Only Portfolios (Net)'
+    )
+```
+
+# Conclusion
+
+So, we have demonstrated that machine-learning methods can be used to form portfolios that outperform traditional methods (that much is very clear) and that their performance improves when adding macroeconomic and sentiment indicators, but is this *specifically* because they can identify market cycles?
+
+This is not a straight-forward question, particularly given the general issues with interpretability of machine-learning models, but we attempt to get something tractable with the following approach: 
+
+1. We use the estimated models to form two ensemble forecasts, the first is an ML ensemble consisting of the return predictions for the NN, RF and GBRT models, and the other consisting of the standard SM models. 
+
+2. For each ensemble, we standardise each of the model predictions to make them comparable, and then take compute the ensemble return prediction as the mean of the individual predictions. 
+
+3. We then take rowsums of the resulting ensemble prediction matrix to get the average return prediction for the ensemble at each point in time. The idea is that this proxies for the ensemble's prediction for the aggregate market return, and we compare this over time for the two different ensembles. 
+
+The results in Figure \@ref(fig:ensemble-plot) are extremely interesting; the ML ensemble does seem to loosely lead the SM ensemble, but more importantly it predicts very consistently low returns in the 2017Q4-2019Q1 period in which the Fed raised interest rates several times, the US/China Trade War began to significantly impact the stock market, and there was a general slowdown in global growth. The SM ensemble does clock on to this too, but it is slower, later and less consistent in its view that returns will be low through this macroeconomic cycle. 
+
+Clearly, significantly more research needs to be put into analysing whether machine-learning models are capable of identifying market cycles, as Kelly and other suggest, in order to state it as fact.  We do, however, find unequivocal evidence that machine-learning models are able to form portfolios which are economically profitable beyond that of traditional methods, and tentative evidence that part of the way they are doing this is through identification of market cycles, justified by the observations that the NN models benefit by far the most from the addition of the macroeconomic & sentiment indices, and the conviction with which the ML ensemble appears to forecast low aggregate returns during the period of fundamental-driven economic slowdown. 
+
+```{r ensemble-predictions, include = FALSE }
+
+ensemble1_predictions <- list(
+    rf_test$test_predictions,
+    xgb_test$test_predictions,
+    nn1_test$test_predictions #, nn2_test$test_predictions
+    )
+
+ensemble2_predictions <- list(
+    ols_test$test_predictions,
+    lasso_test$test_predictions,
+    elastic_net_test$test_predictions,
+    pcr_test$test_predictions,
+    pls_test$test_predictions
+    )
+
+process_ensemble <- function(ensemble_predictions, start_date, num_assets) {
+    scale_predictions <- function(predictions) {
+        scale(predictions)
+    }
+    
+    predictions_to_xts <- function(predictions, start_date, num_assets) {
+        num_periods <- length(predictions) / num_assets
+        pred_matrix <- matrix(predictions, ncol = num_assets, byrow = TRUE)
+        predictions_xts <- xts(
+            pred_matrix, 
+            order.by = seq(from = start_date, by = "month", length.out = num_periods)
+        )
+        return(predictions_xts)
+    }
+    
+    ensemble_xts <- lapply(ensemble_predictions, function(preds) {
+        preds_scaled <- scale_predictions(preds)
+        preds_xts <- predictions_to_xts(preds_scaled, start_date, num_assets)
+        preds_xts
+    })
+    
+    mean_ensemble_xts <- Reduce("+", ensemble_xts) / length(ensemble_xts)
+    
+    colnames(mean_ensemble_xts) <- selected_permnos
+        
+    return(mean_ensemble_xts)
+}
+
+mean_ensemble1_xts <- process_ensemble(ensemble1_predictions, start_date, num_assets = 83)
+
+mean_ensemble2_xts <- process_ensemble(ensemble2_predictions, start_date, num_assets = 83) 
+
+ensemble1_avg_returns <- xts(rowSums(mean_ensemble1_xts) / ncol(mean_ensemble1_xts), order.by = index(mean_ensemble1_xts))
+
+ensemble2_avg_returns <- xts(rowSums(mean_ensemble2_xts) / ncol(mean_ensemble2_xts), order.by = index(mean_ensemble2_xts))
+
+ensemble1_df <- ensemble1_avg_returns %>%
+    tk_tbl(rename_index = "date") %>%
+    mutate(ensemble = "ML") %>% 
+    mutate(value = (value - mean(value)) / sd(value))
+
+ensemble2_df <- ensemble2_avg_returns %>%
+    tk_tbl(rename_index = "date") %>%
+    mutate(ensemble = "SM") %>% 
+    mutate(value = (value - mean(value)) / sd(value))
+
+combined_ensemble_df <- bind_rows(ensemble1_df, ensemble2_df)
+
+macro_ensemble_plot <- ggplot(combined_ensemble_df, aes(x = date, y = cumsum(value), color = ensemble)) +
+    geom_line() + 
+    labs(x = "Date",
+         y = "Average Predicted Return",
+         color = "ensemble") +
+    scale_color_manual(values = c("ML" = "cornflowerblue", "SM" = "red")) +
+    theme_minimal() + 
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_x_date(date_breaks = '2 years', date_labels = '%Y') 
+
+```
+
+
+```{r ensemble-plot, warning = FALSE, echo = FALSE, fig.align = 'center', out.width = '75%', fig.cap = "\\label{fig:figs}Return Prediction Comparison between Ensemble Forecasts"}
+macro_ensemble_plot
+```
+
+```{r ppp, eval = FALSE, include = FALSE}
+# working PPP strategy but no space to include in write-up #
+
+# importing Fama-French 5 factor data for evaluation
+F540_project_data <- dbConnect(
+    SQLite(),
+    'data/F540-project-data', 
+    extended_types = TRUE
+    )
+
+ff5_monthly <- tbl(F540_project_data, 'ff5_monthly') %>% collect()
+
+dbDisconnect(F540_project_data)
+
+ppp_data <- crsp_monthly %>% 
+    filter(permno %in% selected_permnos) %>% 
+    dplyr::select(permno, date, ret_excess, mktcap, mkt_excess)
+
+# create one-month lagged market cap and join to data
+mktcap_lag <- crsp_monthly %>% 
+    mutate(date = date %m+% months(1)) %>% 
+    dplyr::select(permno, date, mktcap_lag = mktcap)
+
+ppp_data <- ppp_data %>% 
+    left_join(mktcap_lag, join_by(permno, date)) %>% 
+    na.omit() # drop first month for which there is no lag
+
+
+# creating momentum_lag and size_lag variables
+ppp_monthly_lags <- ppp_data %>% 
+    transmute(permno, 
+              date_13 = date %m+% months(13),
+              mktcap
+              )
+
+ppp_data <- ppp_data %>% 
+    inner_join(ppp_monthly_lags, 
+               join_by(permno, date == date_13), 
+               suffix = c('', '_13')
+               )
+
+ppp_data <- ppp_data %>% 
+    mutate(
+        momentum_lag = mktcap_lag / mktcap_13,
+        size_lag = log(mktcap_lag)
+    ) %>% 
+    drop_na(contains('lag'))
+
+# cross-sectional standardisation (scaling each feature at each time period)
+ppp_data <- ppp_data %>%
+    group_by(date) %>%
+    mutate(
+        n = n(), # number of assets
+        relative_mktcap = mktcap_lag / sum(mktcap_lag), # use to keep track of value-weighted benchmark portfolio
+        across(contains("lag"), ~ (. - mean(.)) / sd(.))
+    ) %>% # standardisation
+    ungroup() %>%
+    dplyr::select(-mktcap_lag)
+
+# Computing Portfolio Weights #
+
+# define number of parameters using 'lag' in name
+n_parameters <- sum(str_detect(
+    colnames(ppp_data), "lag")
+    )
+
+# computes optimal weights for a given theta 
+compute_portfolio_weights <- function(theta, data,
+                                      value_weighting = FALSE,
+                                      allow_short_selling = TRUE){
+    data %>% 
+        group_by(date) %>% 
+        bind_cols(
+            characteristic_tilt = data %>% 
+                transmute(across(contains('lag'), ~ . / n)) %>% 
+                as.matrix %*% theta %>% as.numeric()
+        ) %>% 
+        mutate(
+            # Definition of benchmark weight
+            weight_benchmark = case_when(
+                value_weighting == TRUE ~ relative_mktcap,
+                value_weighting == FALSE ~ 1 / n
+            ),
+            # Parametric portfolio weights
+            weight_tilt = weight_benchmark + characteristic_tilt,
+            # Short-sell constraint
+            weight_tilt = case_when(
+                allow_short_selling == TRUE ~ weight_tilt,
+                allow_short_selling == FALSE ~ pmax(0, weight_tilt)
+            ),
+            # Weights sum to 1
+            weight_tilt = weight_tilt / sum(weight_tilt)
+        ) %>% 
+        ungroup()
+}
+
+
+# Portfolio Performance Analysis #
+
+# To analyse the performance we focus on the utility of a hypothetical investor with a power/CRRA utility function
+power_utility <- function(r, gamma = 5){
+    (1 + r)^(1 - gamma) / (1 - gamma)
+}
+
+evaluate_portfolio <- function(weights, 
+                               capm_evaluation = TRUE,
+                               full_evaluation = TRUE, 
+                               length_year = 12){
+    evaluation <- weights %>% 
+        group_by(date) %>% 
+        summarise(
+            tilt = weighted.mean(ret_excess, weight_tilt), 
+            benchmark = weighted.mean(ret_excess, weight_benchmark)
+        ) %>% 
+        pivot_longer(-date, 
+                     values_to = 'portfolio_return', 
+                     names_to = 'model'
+        )
+    
+    evaluation_stats <- evaluation %>% 
+        group_by(model) %>% 
+        left_join(ff5_monthly, 
+                  join_by(date == month)) %>% 
+        summarise(tibble(
+            "Expected utility" = mean(power_utility(portfolio_return)),
+            "Average return" = 100 * mean(length_year * portfolio_return),
+            "SD return" = 100 * sqrt(length_year) * sd(portfolio_return),
+            "Sharpe ratio" = sqrt(length_year) * mean(portfolio_return) / sd(portfolio_return),
+        )) %>% 
+        mutate(model = str_remove(model, 'return_'))
+    
+    if (capm_evaluation) {
+        evaluation_capm <- evaluation %>% 
+            left_join(ff5_monthly, 
+                      join_by(date == month)) %>% 
+            group_by(model) %>% 
+            summarise(
+                'CAPM alpha' = coefficients(lm(portfolio_return ~ mkt_excess))[1],
+                'Market Beta' = coefficients(lm(portfolio_return ~ mkt_excess))[2]
+            )
+        
+        evaluation_stats <- evaluation_stats %>% 
+            left_join(evaluation_capm, join_by(model))
+    }
+    
+    if (full_evaluation) {
+        evaluation_weights <- weights %>% 
+            dplyr::select(date, contains('weight')) %>% 
+            pivot_longer(-date, values_to = 'weight', names_to = 'model') %>% 
+            group_by(model, date) %>% 
+            mutate(
+                'Absolute weight' = abs(weight),
+                'Max. weight' = max(weight), 
+                'Min. weight' = min(weight), 
+                'Avg. sum of negative weights' = -sum(weight[weight < 0]),
+                'Avg. fraction of negative weights' = sum(weight < 0) / n(),
+                .keep = 'none'
+            ) %>% 
+            group_by(model) %>% 
+            summarize(across(-date, ~ 100 * mean(.))) %>% 
+            mutate(model = str_remove(model, 'weight_'))
+        
+        evaluation_stats <- evaluation_stats %>% 
+            left_join(evaluation_weights, join_by(model))
+    }
+    
+    evaluation_output <- evaluation_stats %>% 
+        pivot_longer(cols = -model, names_to = 'measure') %>% 
+        pivot_wider(names_from = model) %>% 
+        mutate(across(where(is.numeric), ~ round(., 3)))
+    
+    return(evaluation_output)
+}
+
+
+# Optimal Parameter Choice #
+
+# define helper function to compute objective function
+compute_objective_function <- function(theta, data,
+                                       objective_measure = "Expected utility",
+                                       value_weighting = FALSE,
+                                       allow_short_selling = TRUE) {
+    processed_data <- compute_portfolio_weights(
+        theta,
+        data,
+        value_weighting,
+        allow_short_selling
+    )
+    
+    objective_function <- evaluate_portfolio(
+        processed_data,
+        capm_evaluation = FALSE,
+        full_evaluation = FALSE
+    ) %>%
+        filter(measure == objective_measure) %>%
+        pull(tilt)
+    
+    return(-objective_function)
+}
+
+# generate initial theta and optimise 
+theta <- rep(1, n_parameters)
+names(theta) <- colnames(ppp_data)[str_detect(
+    colnames(ppp_data), "lag")]
+
+weights <- compute_portfolio_weights(theta, ppp_data,
+                                          value_weighting = FALSE,
+                                          allow_short_selling = TRUE)
+
+evaluate_portfolio(weights)
+
+optimal_theta <- optim(
+    par = theta,
+    fn = compute_objective_function,
+    objective_measure = "Expected utility",
+    data = ppp_data,
+    value_weighting = FALSE,
+    allow_short_selling = TRUE,
+    method = "Nelder-Mead"
+    )
+optimal_theta
+compute_objective_function(optimal_theta$par, ppp_data)
+
+optimal_weights <- compute_portfolio_weights(data = ppp_data,
+                                             theta = optimal_theta$par
+                                             )
+
+evaluate_portfolio(optimal_weights)
+```
+
+
